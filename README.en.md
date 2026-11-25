@@ -55,10 +55,10 @@ git clone https://github.com/gpboyer2/dsh-finish-line.git ~/.dsh/plugins/dsh-fin
 # 2. Register with the profile (a CLI-managed profile, such as web / main)
 dsh plugin --profile <your-profile> add link:$HOME/.dsh/plugins/dsh-finish-line
 
-# 3. Fully restart DSH —— host plugins load only at startup
+# 3. Fully restart DSH —— Host plugins load only at startup
 ```
 
-> The `desktop` profile is owned exclusively by DeepSeek Harness.app; `dsh plugin --profile desktop …` from the CLI is rejected. For the desktop build, do it manually in three steps: create a symlink under `~/.dsh/profiles/desktop/node_modules/`, add `"dsh-finish-line": "link:/absolute/path"` to `package.json`'s `dependencies`, append `"dsh-finish-line"` to `dsh.profile.bundles`, then restart. Installing from the in-app "Plugins" page also works.
+> The `desktop` profile is owned exclusively by DeepSeek Harness.app; `dsh plugin --profile desktop …` from the CLI is rejected. For the desktop build, do it manually in three steps: create a same-named symlink under `~/.dsh/profiles/desktop/node_modules/`, add `"dsh-finish-line": "link:/absolute/path"` to `package.json`'s `dependencies`, append `"dsh-finish-line"` to `dsh.profile.bundles`, then restart. Installing from the in-app "Plugins" page also works.
 
 The bundled `cordis.patch.yml` inserts the plugin line and sets the executor to `subagent`. No need to hand-edit the profile's patch file.
 
