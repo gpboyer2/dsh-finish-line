@@ -636,7 +636,8 @@ export function apply(ctx, config = {}) {
       }
 
       // 子代理定不了 → 才把人格请出来（一次模型调用，平时零开销）。
-      if (cfg.subagent.decideOnStuck && needsDecision(summary, cfg.subagent.decideKeywords)) {
+      // persona.enabled 必须是这里的开关之一：子代理模式下没有别处读它。
+      if (cfg.persona.enabled && cfg.subagent.decideOnStuck && needsDecision(summary, cfg.subagent.decideKeywords)) {
         log(`收尾第 ${stageIndex + 1} 步子代理说定不了，请人格拍板`)
         try {
           const resumed = await decideAndContinue(chain, activation.childId, stage, summary, abort.signal)

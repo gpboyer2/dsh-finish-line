@@ -73,7 +73,7 @@ dsh plugin --profile <你的profile> add link:$HOME/.dsh/plugins/dsh-finish-line
 | 空对话子代理 | 不继承聊天记录、不预置人格、不塞上下文。 |
 | 模型继承 | `agentOptions: null`，沿用父会话的模型与推理档。 |
 | 两种执行器 | `subagent`（默认，侧栏不列）或 `session`（两个新会话，侧栏可见）。 |
-| 按需请人格 | 只在子代理汇报「定不了 / 需要拍板」时调一次人格模型，平时零开销。 |
+| 按需请人格 | 只在子代理汇报「定不了 / 需要拍板」时调一次人格模型；不触发时不调用。 |
 | 断点恢复 | 链状态落盘，保留 7 天、最多 300 条。 |
 | dry-run | 只写判定与日志，不启子代理、不改代码。 |
 | 零依赖 | 只用 DSH 注入的宿主服务与 Node 内置模块。 |
@@ -109,11 +109,11 @@ dsh plugin --profile <你的profile> add link:$HOME/.dsh/plugins/dsh-finish-line
 | `subagent.decideKeywords` | 见源码 | 哪些话算「定不了」。 |
 | `subagent.decideMaxWaitMs` | `600000` | 拍板发回后等它这一轮的上限。 |
 | `persona.enabled` | `true` | 人格代答 / 拍板总开关。 |
-| `persona.provider` / `model` | `magpie` / `local-31-99/qwen3.8-27b` | 代答用的模型路由。 |
+| `persona.provider` / `model` | `magpie` / `local-31-99/qwen3.8-27b` | 人格模型路由。默认值是作者本机的路由，其他环境要换成自己的；路由不存在时只记一行「人格拍板失败」，链继续。 |
 | `persona.file` | `~/.dsh/finish-line.persona.md` | 人格文件；不存在时用内置的一份。 |
 | `logFile` | `~/.dsh/logs/finish-line.log` | 日志位置。 |
 
-内置人格是「直接、最小改动、拒绝假兼容、分批提交、不可逆操作谨慎」。要换成自己的，把蒸馏产物写进 `~/.dsh/finish-line.persona.md` 覆盖，代码不用动。
+人格默认用内置的一组规则：直接、最小改动、拒绝假兼容、分批提交、不可逆操作谨慎。想让它更贴近你自己的判断，把规则写进 `~/.dsh/finish-line.persona.md` 覆盖，代码不用动。
 
 ## 两种执行器
 
@@ -122,7 +122,7 @@ dsh plugin --profile <你的profile> add link:$HOME/.dsh/plugins/dsh-finish-line
 | 形态 | 进程内 spawn，空对话，一句话 | 两个全新顶层会话，侧栏可见，一句话 |
 | 模型 | 继承父会话模型 | 继承父会话 preset 与模型 |
 | 可见性 | 父会话的「子代理」目录，侧栏不列 | 侧栏独立会话，可随时接管 |
-| 拿不定主意 | 检测到「定不了」→ 人格决定后发回同一子代理 | `ask_user_question` → 人格代答 |
+| 拿不定主意 | 检测到「定不了」→ 人格决定后发回同一子代理（`persona.enabled: false` 时不拍板） | `ask_user_question` → 人格代答 |
 | 能否提问 | 不能（宿主 `DELEGATED_CALLER` 拒绝） | 能 |
 
 省 token 用 `subagent`；要随时盯着、随时接手用 `session`。
@@ -171,6 +171,7 @@ npm test        # node --test，9 条
 - `session` 模式不代答计划审批。`plan-review` 意图的提问不会被替答，宁可挂住等真人。
 - 必须重启 DSH 才生效。Host 半是进程内模块，只在启动时加载。
 - 依赖三个接缝：`ctx.sessions` / `ctx.subagents` / `ctx.llm`；上游改这些接缝就得跟着改。
+- 人格模型不随仓库提供。默认路由指向作者本机，未替换时拍板调用会失败，只留一行日志，链继续往下走。
 
 ## 许可证
 
