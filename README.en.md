@@ -15,31 +15,37 @@ A DeepSeek Harness (DSH) plugin. A model often stops halfway after writing a fea
 
 ## Trigger conditions
 
-All four conditions must hold at once:
+All five conditions must hold at once:
 
+- **The work must actually be done**: the most recent `turn/end` reason must be `completed`. Quota-cut short (`error`), user interruption (`aborted`), or anything else never triggers — unfinished work does not enter the wrap-up.
 - The session directory is a Git repository with changes.
 - This session made at least one tool call. Pure Q&A does not trigger.
 - Silence for `quietMs` after `turn/end` (default 20 seconds).
 - The session's queued input is empty.
 
+A previous chain on the same session that has already ended (`done` / `failed`) does not block a new round: it is cleared and the session is re-evaluated. Only a chain currently running is not re-triggered.
+
 ## How it works
 
 ```
-turn/end ──▶ quiet 20s ──▶ queue drained ──▶ check: Git repo && changes && tool called
-                                                    │
-                                                    ▼
-                                   subagent A: componentization cleanup
-                                                    │ await result
-                                                    ▼
-                                        subagent B: critical commit
-                                                    │
-                                                    ▼
-                                                  chain done
+turn/end(reason=completed) ──▶ quiet 20s ──▶ queue drained
+                                            │
+                                            ▼
+                              check: Git repo && changes && tool called && work done
+                                            │
+                                            ▼
+                                 subagent A: componentization cleanup
+                                            │ await result
+                                            ▼
+                                 subagent B: critical commit
+                                            │
+                                            ▼
+                                          chain done
 ```
 
 - After the checks pass, subagent A starts and runs "componentization cleanup": it moves shared functions from `git diff` into utils / shared modules.
 - When A ends, subagent B starts and runs "critical commit": it calls `cc-git-commit` to review the diff in batches, commit, and push.
-- Each step is one verbatim sentence, configured in `stages`. Subagents start from an empty conversation, receive only that sentence, read `git diff` themselves, and work from the repository context they find.
+- Each step is one verbatim sentence, configured in `stages`. Subagents start from an empty conversation, receive only that sentence plus the NEED-DECISION protocol, read `git diff` themselves, and work from the repository context they find.
 - No `agentOptions` is passed. Subagents inherit the parent session's provider / model / reasoning tier and are not downgraded to profile defaults.
 - A chain runs once. Chain state is written to disk and restored from the state file after a DSH restart; the chain is not reopened.
 - A turn does not end while the AI is asking a question in the task session, so the chain does not start. It does not answer on the session's behalf.

@@ -343,6 +343,8 @@ export function apply(ctx, config = {}) {
   const toolCalled = new Map()
   const aborts = new Map()
   const childWaiters = new Map()
+  /** 每个会话最近一次 turn/end 的 reason.kind（completed / error / aborted / …）。 */
+  const turnEnds = new Map()
   let personaCache
 
   /* ---------------- 日志与状态 ---------------- */
@@ -547,12 +549,31 @@ export function apply(ctx, config = {}) {
       await advance(chainRootId, session)
       return
     }
-    if (chains.has(session.id)) return
+
+    // 已结束（done / failed）的旧链不挡新一轮：该会话本轮活干完了照样要触发。
+    if (chains.has(session.id)) {
+      const existing = chains.get(session.id)
+      if (existing.status !== 'running') {
+        chains.delete(session.id)
+        for (const sid of existing.sessions) stageSessions.delete(sid)
+        log(`会话 ${session.id} 上有一条已结束的旧链（${existing.status}），清掉后按本轮重新判定`)
+      } else {
+        return
+      }
+    }
     if (!inboxIdle(session)) {
       log(`会话 ${session.id} 还有排队输入，等它跑完再判断`)
       return
     }
     if (cfg.requireToolCall && !hasToolCall(session)) return
+
+    // 活必须真干完：只有最近一次 turn/end 是 completed 才触发。被额度卡断
+    // （error）、用户主动中断（aborted）一律不启动收尾。
+    const reasonKind = turnEnds.get(session.id)
+    if (reasonKind !== 'completed') {
+      log(`会话 ${session.id} 最近一次回合结束原因=${reasonKind ?? '未知'}（非 completed），活没干完，不触发收尾`)
+      return
+    }
 
     const cwd = sessionCwd(session)
     const git = await gitInfo(cwd)
@@ -991,6 +1012,8 @@ export function apply(ctx, config = {}) {
         return
       }
       if (event.type !== 'turn/end') return
+      // 记下这个会话最近一次回合结束的原因，供 evaluate() 判断「活干完了」。
+      turnEnds.set(session.id, event.data?.reason?.kind ?? 'unknown')
       const waiters = childWaiters.get(session.id)
       if (waiters !== undefined && waiters.size > 0) {
         setTimeout(() => {
