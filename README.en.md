@@ -1,6 +1,6 @@
 # dsh-finish-line
 
-> **The work is done; the wrap-up isn't.** —— Once the task session and its queued input are both empty, it runs two wrap-up steps in series: componentization cleanup, then critical commit.
+> Runs two serial wrap-up steps after a task session ends and its queued input drains: componentization cleanup, then critical commit.
 
 [English](README.en.md) · [简体中文](README.md)
 
@@ -11,40 +11,38 @@
 ![tests](https://img.shields.io/badge/tests-9-brightgreen?style=flat-square)
 ![license](https://img.shields.io/badge/license-MIT-brightgreen?style=flat-square)
 
-A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH) plugin. It watches for the end of a session turn. After you stop talking and the queue has drained, it appends two wrap-up steps on its own: first collect the shared functions in `git diff` into utils / shared modules, then call `cc-git-commit` to review the diff in batches, commit, and push.
+A DeepSeek Harness (DSH) plugin. A model often stops halfway after writing a feature: shared functions scattered around, changes uncommitted, the diff unreviewed. Wrap-up is not within the goal of a single task; this plugin moves it after the turn ends and runs it separately.
 
-## What problem it solves
+## Trigger conditions
 
-The model finishes the feature and often just stops there: duplicated functions scattered around, changes not committed, the diff never reviewed. This is not because the model can't do it. "Wrap-up" is simply not part of the goal of a single task.
+All four conditions must hold at once:
 
-- Every time, you have to add a manual line: "tidy up the shared functions", "commit and push". Install it. It hooks in automatically.
-- You want the wrap-up done by a **clean subagent**: one sentence in, it reads the diff itself, and it does not inherit the main session's pile of context. Install it.
-- You want to see what it does first, without real code changes. Install it, set `dryRun: true`, logs only.
-- Your tasks are pure Q&A and never touch files. No need to install. No tool call, no trigger.
-- The directory is not a Git repository. No need to install.
-
-There are only two criteria: the session's directory is a Git repository with changes, and this session made at least one tool call. Pure Q&A, a clean working tree, and non-Git directories never trigger it.
+- The session directory is a Git repository with changes.
+- This session made at least one tool call. Pure Q&A does not trigger.
+- Silence for `quietMs` after `turn/end` (default 20 seconds).
+- The session's queued input is empty.
 
 ## How it works
 
 ```
-turn/end  ──▶ quiet 20s ──▶ session inbox drained ──▶ check: Git repo && changes && tool call
-                                                        │
-                                                        ▼
-                                          subagent A: step ② componentization cleanup
-                                                        │ await result
-                                                        ▼
-                                          subagent B: step ③ critical commit
-                                                        │
-                                                        ▼
+turn/end ──▶ quiet 20s ──▶ queue drained ──▶ check: Git repo && changes && tool called
+                                                    │
+                                                    ▼
+                                   subagent A: componentization cleanup
+                                                    │ await result
+                                                    ▼
+                                        subagent B: critical commit
+                                                    │
+                                                    ▼
                                                   chain done
 ```
 
-- **When it counts as "everything is said"**: after `turn/end`, stay quiet for `quietMs` (default 20 seconds), and the session's queued input is empty. The extra messages you typed run first; they never cut in ahead of the wrap-up.
-- **No preloaded context**: both subagents start from an empty conversation. The first prompt is only that step's one sentence. They read `git diff` themselves and work with the repo context they find.
-- **No model downgrade**: no `agentOptions` is passed; the subagent inherits the parent session's provider / model / reasoning tier. If the parent session has the full model, so does the subagent.
-- **One chain runs once**: chains are tracked per root session and restored from `finish-line.state.json` after a restart. The same chain is never reopened.
-- **The task session is left alone**: the turn does not end while the AI is asking questions, so the chain does not start. It never answers questions for you.
+- After the checks pass, subagent A starts and runs "componentization cleanup": it moves shared functions from `git diff` into utils / shared modules.
+- When A ends, subagent B starts and runs "critical commit": it calls `cc-git-commit` to review the diff in batches, commit, and push.
+- Each step is one verbatim sentence, configured in `stages`. Subagents start from an empty conversation, receive only that sentence, read `git diff` themselves, and work from the repository context they find.
+- No `agentOptions` is passed. Subagents inherit the parent session's provider / model / reasoning tier and are not downgraded to profile defaults.
+- A chain runs once. Chain state is written to disk and restored from the state file after a DSH restart; the chain is not reopened.
+- A turn does not end while the AI is asking a question in the task session, so the chain does not start. It does not answer on the session's behalf.
 
 ## Quick start
 
@@ -52,33 +50,33 @@ turn/end  ──▶ quiet 20s ──▶ session inbox drained ──▶ check: G
 # 1. Clone into ~/.dsh/plugins/dsh-finish-line
 git clone https://github.com/gpboyer2/dsh-finish-line.git ~/.dsh/plugins/dsh-finish-line
 
-# 2. Register with the profile (a CLI-managed profile, such as web / main)
+# 2. Register with a profile (command-line managed profiles such as web / main)
 dsh plugin --profile <your-profile> add link:$HOME/.dsh/plugins/dsh-finish-line
 
-# 3. Fully restart DSH —— Host plugins load only at startup
+# 3. Fully restart DSH. Host plugins load only at startup.
 ```
 
-> The `desktop` profile is owned exclusively by DeepSeek Harness.app; `dsh plugin --profile desktop …` from the CLI is rejected. For the desktop build, do it manually in three steps: create a same-named symlink under `~/.dsh/profiles/desktop/node_modules/`, add `"dsh-finish-line": "link:/absolute/path"` to `package.json`'s `dependencies`, append `"dsh-finish-line"` to `dsh.profile.bundles`, then restart. Installing from the in-app "Plugins" page also works.
+The `desktop` profile is owned by DeepSeek Harness.app, and command-line changes to it are rejected. For the desktop build, do it manually in three steps: create a same-named symlink under `~/.dsh/profiles/desktop/node_modules/`, add `"dsh-finish-line": "link:/absolute/path"` to `dependencies` in `package.json`, append `"dsh-finish-line"` to `dsh.profile.bundles`, then restart. Installing from the in-app Plugins page has the same effect.
 
-The bundled `cordis.patch.yml` inserts the plugin line and sets the executor to `subagent`. No need to hand-edit the profile's patch file.
+The bundled `cordis.patch.yml` inserts the plugin line and sets the executor to `subagent`; no manual edit of the profile's patch file is needed.
 
-**Verification**: in a Git repo with changes, have the AI do a small task that makes a tool call. Wait 20 seconds, then check `~/.dsh/logs/finish-line.log` for `启动收尾链` and the `子代理已启动` / `结束` lines of both steps.
+To verify: in a Git repository with changes, have the AI run a small task that makes a tool call. Wait 20 seconds, then check `~/.dsh/logs/finish-line.log` for `启动收尾链` and the `子代理已启动` / `结束` lines of both steps.
 
-> On a first install, run once with `dryRun: true`: logs only, no code changes. Confirm the trigger timing matches your expectations, then turn it off.
+On a first install, run with `dryRun: true`: logs only, no code changes. Turn it off once the trigger timing is confirmed.
 
 ## Core features
 
 | Capability | Description |
 | --- | --- |
-| **Auto trigger** | Turn ended + quiet window + queue empty + Git has changes + this session called a tool. All five must hold at once before it acts. |
-| **Two serial steps** | ② componentization cleanup → ③ critical commit. The next step starts only after the previous step's subagent has ended. One sentence per step. |
-| **Empty-conversation subagents** | No inherited chat history, no preset persona, no injected context. Tokens are spent on the work only. |
-| **Full-model inheritance** | `agentOptions: null`; the subagent keeps the parent session's model and reasoning tier, not pulled down by profile defaults. |
-| **Two executors** | `subagent` (default: fewer tokens, not listed in the sidebar) or `session` (two new sessions, visible in the sidebar, take over whenever you want). |
-| **Persona on demand** | Only when the subagent itself reports "can't decide / needs a decision" does it call the persona model once to make the call. Zero cost otherwise. |
-| **Resume after restart** | Chain state is written to disk, kept 7 days, at most 300 entries. A DSH restart does not reopen the same chain. |
-| **dry-run** | Writes the decision and logs only; no subagent is really started, no code is changed. |
-| **Zero dependencies** | Only the host services DSH injects and Node built-in modules. `link` install is the most reliable. |
+| Auto trigger | Acts only when all four trigger conditions hold; no fuzzy matching. |
+| Two serial steps | The next step starts only after the previous step's subagent ends; order is changed in `stages`. |
+| Empty-conversation subagents | No inherited chat history, no preset persona, no injected context. |
+| Model inheritance | `agentOptions: null`; keeps the parent session's model and reasoning tier. |
+| Two executors | `subagent` (default, not listed in the sidebar) or `session` (two new sessions, visible in the sidebar). |
+| Persona on demand | Calls the persona model once only when a subagent reports "can't decide / needs a decision"; zero cost otherwise. |
+| Resume | Chain state on disk, kept 7 days, at most 300 entries. |
+| dry-run | Writes the decision and logs only; starts no subagent, changes no code. |
+| Zero dependencies | Only host services injected by DSH and Node built-in modules. |
 
 ## Configuration
 
@@ -98,51 +96,51 @@ Override the plugin line's `config:` in `~/.dsh/profiles/desktop/cordis.patch.ym
 | Key | Default | Description |
 | --- | --- | --- |
 | `enabled` | `true` | Master switch. |
-| `executor` | `subagent` | `subagent`: in-process spawn, empty conversation, not listed in the sidebar; `session`: two brand-new top-level sessions, visible in the sidebar. |
+| `executor` | `subagent` | `subagent`: in-process spawn, empty conversation, not listed in the sidebar; `session`: two new top-level sessions, visible in the sidebar. |
 | `dryRun` | `false` | Logs only, no real run. |
-| `quietMs` | `20000` | How long the silence after `turn/end` must last to count as "everything is said". |
-| `requireToolCall` | `true` | Trigger requires at least one tool call in this session; pure Q&A does not trigger. |
+| `quietMs` | `20000` | Silence window after `turn/end`. |
+| `requireToolCall` | `true` | Triggers only if the session made at least one tool call. |
 | `maxChainAgeMs` | `21600000` | A chain lives at most 6 hours; after that it is not resumed. |
 | `gitTimeoutMs` | `8000` | Per-call timeout for `git status` / `git diff`. |
-| `stages` | Two verbatim sentences | `[{ id, titlePrefix, prompt }]`, one sentence per step; default titles `收尾② 组件化整理` / `收尾③ 批判提交`. Change step order and wording here. |
+| `stages` | Two verbatim sentences | `[{ id, titlePrefix, prompt }]`, one sentence per step; default titles `收尾② 组件化整理` / `收尾③ 批判提交`. Order and wording are changed here. |
 | `subagent.provider` | `spawn` | In-process subagent backend name. |
-| `subagent.agentOptions` | `null` | `null` = not passed; inherit the parent session's full model. |
-| `subagent.decideOnStuck` | `true` | Call the persona only when stuck. |
+| `subagent.agentOptions` | `null` | `null` = not passed; inherits the parent session's model. |
+| `subagent.decideOnStuck` | `true` | Calls the persona only when stuck. |
 | `subagent.decideKeywords` | See source | Which phrases count as "can't decide". |
-| `subagent.decideMaxWaitMs` | `600000` | Upper bound for waiting on its turn after the decision is sent back. |
+| `subagent.decideMaxWaitMs` | `600000` | Upper bound for waiting on that turn after the decision is sent back. |
 | `persona.enabled` | `true` | Master switch for persona answering / deciding. |
 | `persona.provider` / `model` | `magpie` / `local-31-99/qwen3.8-27b` | Model route used for answering. |
 | `persona.file` | `~/.dsh/finish-line.persona.md` | Persona file; the built-in one is used when it does not exist. |
 | `logFile` | `~/.dsh/logs/finish-line.log` | Log location. |
 
-The built-in persona is: direct, minimal change, no fake compatibility, batched commits, careful with irreversible operations. To use your own, write the distilled result into `~/.dsh/finish-line.persona.md` to override it. No code change.
+The built-in persona is: direct, minimal change, no fake compatibility, batched commits, cautious with irreversible operations. To replace it, write a distilled persona to `~/.dsh/finish-line.persona.md` to override it. No code change.
 
-## Choosing between the two executors
+## Two executors
 
 | | `subagent` (default) | `session` |
 | --- | --- | --- |
-| Form | In-process spawned subagent, empty conversation, one sentence | Two brand-new top-level sessions, visible in the sidebar, one sentence |
-| Model | Inherits the parent session's full model | Inherits the parent session's preset and model |
-| What you can see | Listed in the parent session's subagent directory, not in the sidebar | Standalone session in the sidebar; click in and take over any time |
-| Can't decide | Detects "can't decide" → persona decides, then sends back to the same subagent | `ask_user_question` → persona answers instead |
+| Form | In-process spawn, empty conversation, one sentence | Two new top-level sessions, visible in the sidebar, one sentence |
+| Model | Inherits the parent session's model | Inherits the parent session's preset and model |
+| Visibility | Parent session's subagents directory; not listed in the sidebar | Standalone session in the sidebar; can be taken over at any time |
+| Can't decide | Detects "can't decide" → persona decides, then sends back to the same subagent | `ask_user_question` → persona answers |
 | Can it ask questions | No (host `DELEGATED_CALLER` refuses) | Yes |
 
 Use `subagent` to save tokens; use `session` to watch and take over at any time.
 
 ## Logs and diagnostics
 
-- `~/.dsh/logs/finish-line.log`: each step's start, `stopReason`, result summary, when the persona stepped in, and the decision text. Trigger decisions are also logged line by line: non-Git directory, clean working tree, and pending queued input each get a line with the reason.
+- `~/.dsh/logs/finish-line.log`: each step's start, `stopReason`, result summary, when the persona appeared, and the decision text. Trigger checks are also logged line by line: non-Git directory, clean working tree, and pending queued input each get one line with the reason.
 - `~/.dsh/finish-line.state.json`: chains tracked per root session, kept 7 days; placed in the profile directory when `DSH_PROFILE_DIR` is set.
 
-If it did not trigger, locate it from the last log line:
+If it did not trigger, locate the cause from the last log line:
 
 | Appears in the log | Meaning |
 | --- | --- |
-| `不在 Git 仓库` | The session cwd is not a Git repository |
-| `工作区干净` | No changes; does not trigger by design |
-| `还有排队输入` | The extra messages you typed have not finished; wait |
-| `启动收尾链` with no `子代理已启动` after it | The subagent backend did not come up; read the error on the next line |
-| `收尾第 N 步结束 stopReason=…` | That step ended; the summary shows what it did |
+| `不在 Git 仓库` | The session cwd is not a Git repository. |
+| `工作区干净` | No changes; does not trigger by design. |
+| `还有排队输入` | Extra messages have not finished; wait longer. |
+| `启动收尾链` with no `子代理已启动` after it | The subagent backend did not start; read the error on the next line. |
+| `收尾第 N 步结束 stopReason=…` | That step ended; the summary shows what it did. |
 
 ## Architecture
 
@@ -155,24 +153,24 @@ icon.svg              Plugin icon
 test/logic.test.mjs   Pure-logic tests (9)
 ```
 
-Design constraints: only the host services injected via `ctx` (`sessions` / `agents` / `sessionController` / `llm` / `subagents`) and Node built-in modules; no build step; state and logs both live under `~/.dsh`.
+Uses only host services injected via `ctx` (`sessions` / `agents` / `sessionController` / `llm` / `subagents`) and Node built-in modules; no build step; state and logs both live under `~/.dsh`.
 
-## Development and testing
+## Tests
 
 ```sh
 npm test        # node --test, 9 tests
 ```
 
-Coverage: config defaults and clamping of invalid values, each step's first prompt matching the configured sentence verbatim, the 80-byte cap on `stageTitle`, detection of "can't decide" signals, validation of question answers (single choice / multi choice / custom / no options), and tolerance when parsing model output.
+Coverage: config defaults and clamping of invalid values, each step's first prompt matching the configured sentence verbatim, the 80-byte cap on `stageTitle`, detection of "can't decide" signals, validation of question answers (single choice / multiple choice / custom / no options), and tolerant parsing of model output.
 
-## Known limits
+## Limits
 
-- **Subagents are not visible in the sidebar**: to take over, set `executor: session`, or go to the parent session's subagent directory.
-- **"Can't decide" relies on signal phrases**: a misjudgement costs one extra persona call; it does not redo the work.
-- **A large untracked directory also counts as a change**: `git status` counts it as "has changes"; commit or clean up first in that case.
-- **`session` mode does not answer plan approvals**: questions with `plan-review` intent are not answered for you; it would rather hang and wait for a human.
-- **A DSH restart is required**: the host half is an in-process module and loads only at startup.
-- **Depends on three seams**: `ctx.sessions` / `ctx.subagents` / `ctx.llm`; if upstream changes these seams, this plugin has to follow.
+- Subagents are not listed in the sidebar. To take over, set `executor: session` or open the parent session's subagents directory.
+- "Can't decide" relies on signal phrases. A false positive costs one extra persona call and does not redo the work.
+- A large untracked directory also counts as a change. `git status` reports it as "has changes"; commit or clean it first.
+- `session` mode does not answer plan approvals. Questions with `plan-review` intent are not answered; the chain would rather hang and wait for a human.
+- A DSH restart is required. The host half is an in-process module and loads only at startup.
+- Depends on three seams: `ctx.sessions` / `ctx.subagents` / `ctx.llm`. If upstream changes these seams, this plugin has to follow.
 
 ## License
 

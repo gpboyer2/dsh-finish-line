@@ -1,6 +1,6 @@
 # dsh-finish-line
 
-> **活干完了，收尾还没干。** —— 任务会话、排队输入都清空之后，自动串行跑完「组件化整理」和「批判提交」两步。
+> 一句话：任务会话结束、排队输入清空后，自动串行执行两步收尾——先把公共函数收进公共模块，再分批审 diff、提交、推送。
 
 [简体中文](README.md) · [English](README.en.md)
 
@@ -11,40 +11,38 @@
 ![tests](https://img.shields.io/badge/tests-9-brightgreen?style=flat-square)
 ![license](https://img.shields.io/badge/license-MIT-brightgreen?style=flat-square)
 
-一个 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）插件。它监听会话回合结束，在你把话说完、队列也跑完之后，自动接上两步收尾：先把 `git diff` 里的公共函数收进 utils / 公共模块，再调 `cc-git-commit` 分批审 diff、提交、推送。
+一个 DeepSeek Harness（DSH）插件。模型写完功能常常停在半路：公共函数散在各处，改动没提交，diff 没人审。收尾不在一轮任务的目标范围内，本插件把它挪到回合结束之后单独执行。
 
-## 它解决什么问题
+## 触发条件
 
-模型把功能写完，常常就停在那里：重复函数散落在各处，改动没提交，diff 没人审。这不是模型不会，而是「收尾」本身不在一次任务的目标里。
+以下四条同时满足才启动：
 
-- 你每次都得手动补一句「整理一下公共函数」「提交推送」。装。它自动接上。
-- 你希望收尾由一个**干净的子代理**来做，只给一句话、自己看 diff，不继承主会话那一大堆上下文。装。
-- 你想先看它怎么动，不想真改代码。装，开 `dryRun: true`，只写日志。
-- 你的任务都是纯问答、从不改文件。不用装。没有工具调用就不会触发。
-- 目录不是 Git 仓库。不用装。
+- 会话所在目录是 Git 仓库，且有改动。
+- 本会话至少发生过一次工具调用。纯问答不触发。
+- `turn/end` 之后静默 `quietMs`（默认 20 秒）。
+- 该会话的排队输入已清空。
 
-判断标准只有两条：会话所在目录是 Git 仓库且有改动，且本会话至少发生过一次工具调用。纯问答、干净工作区、非 Git 目录都不会触发。
-
-## 工作原理
+## 工作方式
 
 ```
-turn/end  ──▶ 静默 20s ──▶ 会话 inbox 已清空 ──▶ 判定：Git 仓库 && 有改动 && 调过工具
-                                                        │
-                                                        ▼
-                                          子代理 A：第 ② 句「组件化整理」
-                                                        │ await result
-                                                        ▼
-                                          子代理 B：第 ③ 句「批判提交」
-                                                        │
-                                                        ▼
-                                                    链完成
+turn/end ──▶ 静默 20s ──▶ 排队输入清空 ──▶ 判定：Git 仓库 && 有改动 && 调过工具
+                                                    │
+                                                    ▼
+                                      子代理 A：组件化整理
+                                                    │ await result
+                                                    ▼
+                                      子代理 B：批判提交
+                                                    │
+                                                    ▼
+                                                 链完成
 ```
 
-- **什么时候算「都说完了」**：`turn/end` 之后静默 `quietMs`（默认 20 秒），且该会话的排队输入已经清空。你多敲的几条会先跑完，不会和收尾插队。
-- **上下文不预置**：两个子代理都以空对话开始，首条提示只有那一步的一句原话。它们自己看 `git diff`、自己结合仓库上下文干活。
-- **模型不降级**：不传 `agentOptions`，子代理继承父会话的 provider / model / 推理档。父会话是满血模型，它就是满血。
-- **一条链只跑一次**：按根会话记链，重启后从 `finish-line.state.json` 恢复，不会重开。
-- **任务会话本身不干预**：AI 提问时回合不结束，链也不会启动；它不会替你去答问题。
+- 判定通过后启动子代理 A，执行「组件化整理」：把 `git diff` 里的公共函数收进 utils / 公共模块。
+- A 结束后启动子代理 B，执行「批判提交」：调 `cc-git-commit` 分批审 diff、提交、推送。
+- 两步各是一句原话，在 `stages` 里配置。子代理从空对话开始，只收到这一句，自己看 `git diff`，结合仓库上下文干活。
+- 不传 `agentOptions`，子代理继承父会话的 provider / model / 推理档，不会被 profile 的默认值降级。
+- 一条链只跑一次。链状态落盘，DSH 重启后从状态文件恢复，不会重开。
+- 任务会话里 AI 提问时回合不结束，收尾链不会启动；它不替你回答。
 
 ## 快速开始
 
@@ -58,27 +56,27 @@ dsh plugin --profile <你的profile> add link:$HOME/.dsh/plugins/dsh-finish-line
 # 3. 完整重启 DSH —— Host 插件只在启动时加载
 ```
 
-> `desktop` profile 由 DeepSeek Harness.app 独占，命令行 `dsh plugin --profile desktop …` 会被拒。桌面版手动三步：在 `~/.dsh/profiles/desktop/node_modules/` 下建同名软链、`package.json` 的 `dependencies` 加 `"dsh-finish-line": "link:/绝对路径"`、`dsh.profile.bundles` 末尾加 `"dsh-finish-line"`，再重启。在应用内「插件」页安装也一样。
+`desktop` profile 由 DeepSeek Harness.app 独占，命令行会被拒。桌面版手动三步：在 `~/.dsh/profiles/desktop/node_modules/` 下建同名软链、`package.json` 的 `dependencies` 加 `"dsh-finish-line": "link:/绝对路径"`、`dsh.profile.bundles` 末尾加 `"dsh-finish-line"`，再重启。在应用内「插件」页安装也一样。
 
-包内的 `cordis.patch.yml` 会自动插入插件行，并把执行器设为 `subagent`。不用手改 profile 的 patch 文件。
+包内的 `cordis.patch.yml` 自动插入插件行并把执行器设为 `subagent`，不用手改 profile 的 patch 文件。
 
-**验证**：在一个有改动的 Git 仓库里让 AI 干一件带工具调用的小活，等 20 秒，看 `~/.dsh/logs/finish-line.log` 是否出现「启动收尾链」以及两步的「子代理已启动 / 结束」。
+验证：在一个有改动的 Git 仓库里让 AI 干一件带工具调用的小活。等 20 秒，看 `~/.dsh/logs/finish-line.log` 是否出现「启动收尾链」，以及两步的「子代理已启动 / 结束」。
 
-> 首次安装建议先 `dryRun: true` 跑一遍：只写日志、不动代码，确认触发时机符合预期再关掉。
+首次安装建议先 `dryRun: true`：只写日志、不动代码，确认触发时机后再关掉。
 
 ## 核心功能
 
 | 能力 | 说明 |
 | --- | --- |
-| **自动触发** | 回合结束 + 静默窗口 + 队列清空 + Git 有改动 + 本会话调过工具，五条同时满足才动手。 |
-| **两步串行** | ② 组件化整理 → ③ 批判提交，前一步的子代理结束后才启下一步；每步一句话。 |
-| **空对话子代理** | 不继承父会话聊天记录，不预置人格，不塞上下文；token 只花在活上。 |
-| **满血继承** | `agentOptions: null`，子代理沿用父会话的模型与推理档，不被 profile 默认值拖低。 |
-| **两种执行器** | `subagent`（默认，省 token、侧栏不列）或 `session`（两个新会话，侧栏可见，可随时接管）。 |
-| **按需请人格** | 只有子代理自己汇报「定不了 / 需要拍板」时，才调一次人格模型替它拍一句；平时零开销。 |
-| **断点恢复** | 链状态落盘，保留 7 天、最多 300 条；DSH 重启后不会重开同一条链。 |
-| **dry-run** | 只写判定与日志，不真正启子代理、不改代码。 |
-| **零依赖** | 只用 DSH 注入的宿主服务与 Node 内置模块，`link` 安装最稳。 |
+| 自动触发 | 四条触发条件同时满足才动手，不做模糊判断。 |
+| 两步串行 | 前一步的子代理结束后才启下一步；顺序在 `stages` 里改。 |
+| 空对话子代理 | 不继承聊天记录、不预置人格、不塞上下文。 |
+| 模型继承 | `agentOptions: null`，沿用父会话的模型与推理档。 |
+| 两种执行器 | `subagent`（默认，侧栏不列）或 `session`（两个新会话，侧栏可见）。 |
+| 按需请人格 | 只在子代理汇报「定不了 / 需要拍板」时调一次人格模型，平时零开销。 |
+| 断点恢复 | 链状态落盘，保留 7 天、最多 300 条。 |
+| dry-run | 只写判定与日志，不启子代理、不改代码。 |
+| 零依赖 | 只用 DSH 注入的宿主服务与 Node 内置模块。 |
 
 ## 配置
 
@@ -100,13 +98,13 @@ dsh plugin --profile <你的profile> add link:$HOME/.dsh/plugins/dsh-finish-line
 | `enabled` | `true` | 总开关。 |
 | `executor` | `subagent` | `subagent`：进程内 spawn，空对话，侧栏不列；`session`：两个全新顶层会话，侧栏可见。 |
 | `dryRun` | `false` | 只写日志、不真跑。 |
-| `quietMs` | `20000` | `turn/end` 之后静默多久算「都说完了」。 |
-| `requireToolCall` | `true` | 本会话至少一次工具调用才触发；纯问答不触发。 |
+| `quietMs` | `20000` | `turn/end` 之后的静默窗口。 |
+| `requireToolCall` | `true` | 本会话至少一次工具调用才触发。 |
 | `maxChainAgeMs` | `21600000` | 一条链最长存活 6 小时，超时不再恢复。 |
 | `gitTimeoutMs` | `8000` | `git status` / `git diff` 的单次超时。 |
-| `stages` | 两句原话 | `[{ id, titlePrefix, prompt }]`，每一步只发一句。两步的顺序、文案都在这里改。 |
+| `stages` | 两句原话 | `[{ id, titlePrefix, prompt }]`，每步一句，顺序与文案都在这里改。 |
 | `subagent.provider` | `spawn` | 进程内子代理后端名。 |
-| `subagent.agentOptions` | `null` | `null` = 不传，继承父会话满血模型。 |
+| `subagent.agentOptions` | `null` | `null` = 不传，继承父会话模型。 |
 | `subagent.decideOnStuck` | `true` | 卡住时才请人格。 |
 | `subagent.decideKeywords` | 见源码 | 哪些话算「定不了」。 |
 | `subagent.decideMaxWaitMs` | `600000` | 拍板发回后等它这一轮的上限。 |
@@ -115,34 +113,34 @@ dsh plugin --profile <你的profile> add link:$HOME/.dsh/plugins/dsh-finish-line
 | `persona.file` | `~/.dsh/finish-line.persona.md` | 人格文件；不存在时用内置的一份。 |
 | `logFile` | `~/.dsh/logs/finish-line.log` | 日志位置。 |
 
-内置人格是「直接、最小改动、拒绝假兼容、分批提交、不可逆操作谨慎」。要换成你自己的，把蒸馏产物写进 `~/.dsh/finish-line.persona.md` 覆盖，代码不用动。
+内置人格是「直接、最小改动、拒绝假兼容、分批提交、不可逆操作谨慎」。要换成自己的，把蒸馏产物写进 `~/.dsh/finish-line.persona.md` 覆盖，代码不用动。
 
-## 两种执行器怎么选
+## 两种执行器
 
 | | `subagent`（默认） | `session` |
 | --- | --- | --- |
-| 形态 | 进程内 spawn 子代理，空对话，一句话 | 两个全新顶层会话，侧栏可见，一句话 |
-| 模型 | 继承父会话满血模型 | 继承父会话 preset 与模型 |
-| 你能看到 | 父会话的「子代理」目录里，侧栏不列 | 侧栏独立会话，随时点进去接管 |
+| 形态 | 进程内 spawn，空对话，一句话 | 两个全新顶层会话，侧栏可见，一句话 |
+| 模型 | 继承父会话模型 | 继承父会话 preset 与模型 |
+| 可见性 | 父会话的「子代理」目录，侧栏不列 | 侧栏独立会话，可随时接管 |
 | 拿不定主意 | 检测到「定不了」→ 人格决定后发回同一子代理 | `ask_user_question` → 人格代答 |
-| 能不能提问 | 不能（宿主 `DELEGATED_CALLER` 拒绝） | 能 |
+| 能否提问 | 不能（宿主 `DELEGATED_CALLER` 拒绝） | 能 |
 
-省 token 走 `subagent`；想随时盯着、随时接手走 `session`。
+省 token 用 `subagent`；要随时盯着、随时接手用 `session`。
 
 ## 日志与诊断
 
-- `~/.dsh/logs/finish-line.log`：每步启动、`stopReason`、结果摘要、人格何时出场、拍板内容。触发判定也逐条记：非 Git 目录、工作区干净、还有排队输入，都会写一行原因。
+- `~/.dsh/logs/finish-line.log`：每步启动、`stopReason`、结果摘要、人格何时出场、拍板内容。触发判定也逐条记：非 Git 目录、工作区干净、还有排队输入，各写一行原因。
 - `~/.dsh/finish-line.state.json`：按根会话记链，保留 7 天；设置了 `DSH_PROFILE_DIR` 时落在 profile 目录。
 
 一次没触发，按日志最后一行定位：
 
 | 日志里出现 | 含义 |
 | --- | --- |
-| 「不在 Git 仓库」 | 会话 cwd 不是 Git 仓库 |
-| 「工作区干净」 | 没有改动，按设计不触发 |
-| 「还有排队输入」 | 你多敲的消息还没跑完，再等 |
-| 「启动收尾链」之后没有「子代理已启动」 | 子代理后端没起来，看下一行的错误 |
-| 「收尾第 N 步结束 stopReason=…」 | 该步结束，摘要里能看到它干了什么 |
+| 「不在 Git 仓库」 | 会话 cwd 不是 Git 仓库。 |
+| 「工作区干净」 | 没有改动，按设计不触发。 |
+| 「还有排队输入」 | 多敲的消息还没跑完，再等。 |
+| 「启动收尾链」后没有「子代理已启动」 | 子代理后端没起来，看下一行错误。 |
+| 「收尾第 N 步结束 stopReason=…」 | 该步结束，摘要里有它做了什么。 |
 
 ## 架构
 
@@ -155,24 +153,24 @@ icon.svg              插件图标
 test/logic.test.mjs   纯逻辑测试（9 条）
 ```
 
-设计约束：只用 `ctx` 注入的宿主服务（`sessions` / `agents` / `sessionController` / `llm` / `subagents`）与 Node 内置模块；没有构建步骤；状态与日志都落在 `~/.dsh` 下。
+只用 `ctx` 注入的宿主服务（`sessions` / `agents` / `sessionController` / `llm` / `subagents`）与 Node 内置模块；没有构建步骤；状态与日志都落在 `~/.dsh` 下。
 
-## 开发与测试
+## 测试
 
 ```sh
 npm test        # node --test，9 条
 ```
 
-覆盖点：配置默认值与非法值钳制、每步首条提示与用户原文逐字一致、`stageTitle` 的 80 字节上限、「定不了」信号识别、提问答案的校验（单选/多选/自定义/无选项）、模型输出解析容错。
+覆盖配置默认值与非法值钳制、每步首条提示与配置原文逐字一致、`stageTitle` 的 80 字节上限、「定不了」信号识别、提问答案校验（单选 / 多选 / 自定义 / 无选项）、模型输出解析容错。
 
-## 已知边界
+## 边界
 
-- **子代理侧栏不可见**：要接管就改 `executor: session`，或去父会话的子代理目录。
-- **「定不了」靠信号词**：误判只会多一次人格调用，不会重复干活。
-- **未跟踪的大目录也算改动**：`git status` 会把它算作「有改动」；这种情况先提交或清理。
-- **`session` 模式不代答计划审批**：`plan-review` 意图的提问不会被替答，宁可挂住等真人。
-- **必须重启 DSH 才生效**：Host 半是进程内模块，只在启动时加载。
-- **依赖三个接缝**：`ctx.sessions` / `ctx.subagents` / `ctx.llm`；上游改这些接缝就得跟着改。
+- 子代理侧栏不可见。要接管就改 `executor: session`，或去父会话的子代理目录。
+- 「定不了」靠信号词。误判只会多一次人格调用，不会重复干活。
+- 未跟踪的大目录也算改动。`git status` 会把它算作「有改动」，先提交或清理。
+- `session` 模式不代答计划审批。`plan-review` 意图的提问不会被替答，宁可挂住等真人。
+- 必须重启 DSH 才生效。Host 半是进程内模块，只在启动时加载。
+- 依赖三个接缝：`ctx.sessions` / `ctx.subagents` / `ctx.llm`；上游改这些接缝就得跟着改。
 
 ## 许可证
 
