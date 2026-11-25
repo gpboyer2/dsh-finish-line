@@ -2,9 +2,10 @@
 #
 # 插入本插件一行。executor: subagent —— 收尾两步走进程内 spawn 子代理：
 #   · 不传 agentOptions，子代理继承父会话的 provider/model（满血）
-#   · 子代理空对话开始，首条提示只有那一步的一句原话，父上下文与人格都不预置
-#   · 子代理不能 ask_user_question（宿主 DELEGATED_CALLER）；只有它自己汇报说
-#     「定不了」时，才把人格请出来替它拍一句，平时不花这份 token
+#   · 子代理空对话开始，首条提示 = 步骤原话 + NEED-DECISION 协议，父上下文不预置
+#   · 子代理不能 ask_user_question（宿主 DELEGATED_CALLER）；它汇报「定不了」
+#     时，蒸馏人格必然拍板，决定发回同一子代理。这是必然业务，没有开关，
+#     也不绑定任何机器上的离线模型（路由跟随宿主 agentDefaultModel）。
 # 想改回「侧栏可见的两个新会话 + 人格代答」：executor: session。
 # 首次想只看不动手：dryRun: true。
 - insert:
@@ -19,8 +20,3 @@
         subagent:
           provider: spawn
           agentOptions: null
-          decideOnStuck: true
-        persona:
-          enabled: true
-          provider: magpie
-          model: local-31-99/qwen3.8-27b

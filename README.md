@@ -70,10 +70,10 @@ dsh plugin --profile <你的profile> add link:$HOME/.dsh/plugins/dsh-finish-line
 | --- | --- |
 | 自动触发 | 四条触发条件同时满足才动手，不做模糊判断。 |
 | 两步串行 | 前一步的子代理结束后才启下一步；顺序在 `stages` 里改。 |
-| 空对话子代理 | 不继承聊天记录、不预置人格、不塞上下文。 |
+| 空对话子代理 | 不继承聊天记录、不预置上下文，只发步骤原话 + NEED-DECISION 协议。 |
 | 模型继承 | `agentOptions: null`，沿用父会话的模型与推理档。 |
 | 两种执行器 | `subagent`（默认，侧栏不列）或 `session`（两个新会话，侧栏可见）。 |
-| 按需请人格 | 只在子代理汇报「定不了 / 需要拍板」时调一次人格模型，平时零开销。 |
+| 人格必然介入 | 子代理汇报「定不了 / 需要拍板」→ 蒸馏人格必然拍板，决定发回同一子代理；session 模式的收尾提问必然由人格代答。**没有开关，是必然业务。** |
 | 断点恢复 | 链状态落盘，保留 7 天、最多 300 条。 |
 | dry-run | 只写判定与日志，不启子代理、不改代码。 |
 | 零依赖 | 只用 DSH 注入的宿主服务与 Node 内置模块。 |
@@ -105,27 +105,34 @@ dsh plugin --profile <你的profile> add link:$HOME/.dsh/plugins/dsh-finish-line
 | `stages` | 两句原话 | `[{ id, titlePrefix, prompt }]`，每步一句，顺序与文案都在这里改。 |
 | `subagent.provider` | `spawn` | 进程内子代理后端名。 |
 | `subagent.agentOptions` | `null` | `null` = 不传，继承父会话模型。 |
-| `subagent.decideOnStuck` | `true` | 卡住时才请人格。 |
-| `subagent.decideKeywords` | 见源码 | 哪些话算「定不了」。 |
-| `subagent.decideMaxWaitMs` | `600000` | 拍板发回后等它这一轮的上限。 |
-| `persona.enabled` | `true` | 人格代答 / 拍板总开关。 |
-| `persona.provider` / `model` | `magpie` / `local-31-99/qwen3.8-27b` | 代答用的模型路由。 |
-| `persona.file` | `~/.dsh/finish-line.persona.md` | 人格文件；不存在时用内置的一份。 |
+| `subagent.decideKeywords` | 见源码 | 哪些汇报算「定不了」（含 `NEED-DECISION`）。命中则人格**必然**拍板，没有开关。 |
+| `subagent.decideMaxWaitMs` | `600000` | 拍板发回后等它这一轮的上限。拍板失败 → 链标 `failed`，卡点原文写进日志，绝不静默跳过。 |
+| `persona.file` | 仓库内 `persona/persona.md` | 蒸馏人格产物，随本仓库分发。读不到/为空 = 安装损坏，报错；**没有内置假人格兜底**。 |
+| `persona.maxContextBytes` / `maxOutputTokens` | `24576` / `700` | session 模式代答的会话摘要上限 / 单次输出上限。 |
+| `persona.timeoutMs` / `retries` | `90000` / `1` | 人格调用的超时与重试。 |
+| `persona.subagentRules` | 见源码 | 注入给子代理的 NEED-DECISION 协议。 |
 | `logFile` | `~/.dsh/logs/finish-line.log` | 日志位置。 |
 
-内置人格是「直接、最小改动、拒绝假兼容、分批提交、不可逆操作谨慎」。要换成自己的，把蒸馏产物写进 `~/.dsh/finish-line.persona.md` 覆盖，代码不用动。
+**人格的四条铁律（2026-11-25 用户定死，不可配置）：**
+
+1. 子代理 A（组件化整理）或 B（批判提交）遇到需要用户拍板的事，**必然**把蒸馏人格请出来判定，决定发回同一个子代理继续。靠 `NEED-DECISION` 协议触发，不靠开关。
+2. 人格**不绑定任何特定机器上的离线模型**。推理路由跟随宿主 `agentDefaultModel` 的当前选择（GUI 里选的默认模型），换环境自动换。
+3. 蒸馏人格产物 `persona/persona.md` **在本仓库里**，装上就有；不是 `~/.dsh` 下的散落文件，也没有「还没蒸馏就先用内置兜底」这一说。
+4. 拍板/代答失败不作假成功：subagent 模式链停下并把卡点原文写进日志，session 模式交回真人。
+
+人格文件是「拍板判据库」而不是人物传记——按用户的真实 pushback 建模为「意图 + 满足判据 + 触发条件」，每条判据附语料证据。要重蒸馏，改 `persona/persona.md` 即可，代码不用动。
 
 ## 两种执行器
 
 | | `subagent`（默认） | `session` |
 | --- | --- | --- |
-| 形态 | 进程内 spawn，空对话，一句话 | 两个全新顶层会话，侧栏可见，一句话 |
+| 形态 | 进程内 spawn，空对话，步骤原话 + NEED-DECISION 协议 | 两个全新顶层会话，侧栏可见，一句原话 |
 | 模型 | 继承父会话模型 | 继承父会话 preset 与模型 |
 | 可见性 | 父会话的「子代理」目录，侧栏不列 | 侧栏独立会话，可随时接管 |
-| 拿不定主意 | 检测到「定不了」→ 人格决定后发回同一子代理 | `ask_user_question` → 人格代答 |
-| 能否提问 | 不能（宿主 `DELEGATED_CALLER` 拒绝） | 能 |
+| 拿不定主意 | **必然**：检测到「定不了」→ 人格拍板 → 发回同一子代理 | **必然**：`ask_user_question` → 人格代答 |
+| 能否提问 | 不能（宿主 `DELEGATED_CALLER` 拒绝），靠协议喊 NEED-DECISION | 能，由人格拦下代答 |
 
-省 token 用 `subagent`；要随时盯着、随时接手用 `session`。
+省 token 用 `subagent`；要随时盯着、随时接手用 `session`。两种执行器的人格介入都是必然业务，只是形态不同。
 
 ## 日志与诊断
 
@@ -145,32 +152,34 @@ dsh plugin --profile <你的profile> add link:$HOME/.dsh/plugins/dsh-finish-line
 ## 架构
 
 ```
-index.js              插件全部逻辑：触发判定、链状态机、子代理 spawn、人格拍板、代答
-cordis.patch.yml      bundle patch：插入插件行并给默认配置
-locale/zh.json        插件市场里的中文名与一句话描述
-locale/en.json        英文名与描述
-icon.svg              插件图标
-test/logic.test.mjs   纯逻辑测试（9 条）
+index.js                  插件全部逻辑：触发判定、链状态机、子代理 spawn、人格拍板、代答
+persona/persona.md        蒸馏人格产物（判据库），随仓库分发
+cordis.patch.yml          bundle patch：插入插件行并给默认配置
+locale/zh.json            插件市场里的中文名与一句话描述
+locale/en.json            英文名与描述
+icon.svg                  插件图标
+test/logic.test.mjs       纯逻辑测试（13 条）
 ```
 
-只用 `ctx` 注入的宿主服务（`sessions` / `agents` / `sessionController` / `llm` / `subagents`）与 Node 内置模块；没有构建步骤；状态与日志都落在 `~/.dsh` 下。
+只用 `ctx` 注入的宿主服务（`sessions` / `agents` / `sessionController` / `llm` / `subagents` / `agentDefaultModel`）与 Node 内置模块；没有构建步骤；状态与日志都落在 `~/.dsh` 下。
 
 ## 测试
 
 ```sh
-npm test        # node --test，9 条
+npm test        # node --test，13 条
 ```
 
-覆盖配置默认值与非法值钳制、每步首条提示与配置原文逐字一致、`stageTitle` 的 80 字节上限、「定不了」信号识别、提问答案校验（单选 / 多选 / 自定义 / 无选项）、模型输出解析容错。
+覆盖配置默认值与非法值钳制、人格无开关（enabled/provider/model/decideOnStuck 均不存在）、人格产物路径在仓库内、每步首条提示与配置原文逐字一致、NEED-DECISION 协议注入与信号词咬合、「定不了」信号识别、提问答案校验（单选 / 多选 / 自定义 / 无选项）、模型输出解析容错。
 
 ## 边界
 
 - 子代理侧栏不可见。要接管就改 `executor: session`，或去父会话的子代理目录。
-- 「定不了」靠信号词。误判只会多一次人格调用，不会重复干活。
+- 「定不了」靠协议 + 信号词；误判只会多一次人格调用，不会重复干活；漏判不会静默放过——拍板失败链会停下，卡点留在日志。
+- 人格拍板用的模型是宿主 GUI 里选的默认模型（`agentDefaultModel.currentSelection()`），不绑定任何机器。没配过默认模型 → 拍板失败并记日志，链停下。
 - 未跟踪的大目录也算改动。`git status` 会把它算作「有改动」，先提交或清理。
 - `session` 模式不代答计划审批。`plan-review` 意图的提问不会被替答，宁可挂住等真人。
 - 必须重启 DSH 才生效。Host 半是进程内模块，只在启动时加载。
-- 依赖三个接缝：`ctx.sessions` / `ctx.subagents` / `ctx.llm`；上游改这些接缝就得跟着改。
+- 依赖宿主接缝：`ctx.sessions` / `ctx.subagents` / `ctx.llm` / `ctx.agentDefaultModel`；上游改这些接缝就得跟着改。
 
 ## 许可证
 

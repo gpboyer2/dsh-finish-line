@@ -10,10 +10,21 @@
  *     的 provider/model/推理档**（父会话是满血模型，子代理不再被 profile 里的
  *     27B 默认值拖低）；空对话开始 + 只发两句话，父上下文不会渗进来；子代理
  *     侧边栏隐藏，要接手在父会话的子代理面板里看。代价：子代理**不能**
- *     ask_user_question（宿主以 DELEGATED_CALLER 拒绝），所以人格规则写进
- *     提示词，让它遇到拿不准的自己定。
- *   - `session`：开两个全新顶层会话（侧边栏可见），老路；这条路才启用
- *     「人格代答」——拦 user-questions/request，用 persona 模型选答案。
+ *     ask_user_question（宿主以 DELEGATED_CALLER 拒绝），所以遇到「该用户拍板」
+ *     的事它汇报 NEED-DECISION，蒸馏人格（本仓库 persona/persona.md）必然替它
+ *     拍板，决定发回同一个子代理继续。
+ *   - `session`：开两个全新顶层会话（侧边栏可见），老路；这条路的人格介入
+ *     形态是拦 user-questions/request 代答。
+ *
+ * 人格（用户 2026-11-25 定死，不可退让）：
+ *   - 蒸馏产物与本插件同仓库（persona/persona.md），装上就在，不依赖任何
+ *     机器上的外部产物；读不到就是安装损坏，报错，不用内置假人格兜底。
+ *   - 人格介入是必然业务：子代理汇报「定不了」必调、session 模式的收尾提问
+ *     必代答。没有 enabled / decideOnStuck 这类开关。
+ *   - 人格模型的推理路由跟随宿主 `agentDefaultModel` 的当前选择（GUI 里选的
+ *     默认模型）；不绑定、不提及任何特定机器上的离线模型。
+ *   - 代答失败不作假成功：session 模式交回真人（next()）；subagent 模式链停下
+ *     并标 failed，把子代理卡点原文写进日志，绝不静默继续下一步。
  *
  * 规则（用户 2026-11-25 明确要求）：
  *   - 触发：会话所在目录是 Git 仓库且有改动 → 必然触发；纯问答不触发。
@@ -32,6 +43,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { execFile } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
+import { fileURLToPath } from 'node:url'
 
 /** 插件 id，需与 cordis.patch.yml 的 id 一致。 */
 export const name = 'dsh-finish-line'
@@ -44,6 +56,9 @@ const SOURCE_KIND = `plugin:${name}`
 
 const STATE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000
 const STATE_MAX_CHAINS = 300
+
+/** 插件目录（人格产物随仓库分发，装上就在）。 */
+const PLUGIN_DIR = path.dirname(fileURLToPath(import.meta.url))
 
 /** 默认配置。 */
 export const DEFAULTS = {
@@ -79,9 +94,7 @@ export const DEFAULTS = {
      * reasoningEffort（父会话是满血模型时，子代理也是）。
      */
     agentOptions: null,
-    /** 卡住时是否把人格请出来（只在子代理自己说「定不了」时才调用，平时零开销）。 */
-    decideOnStuck: true,
-    /** 子代理汇报里出现这些信号，才认为它卡住了。 */
+    /** 子代理汇报里出现这些信号，必然把人格请出来拍板（非开关，无退出条件）。 */
     decideKeywords: [
       '无法继续',
       '无法确定',
@@ -97,34 +110,25 @@ export const DEFAULTS = {
     decideMaxWaitMs: 600000,
   },
   persona: {
-    enabled: true,
-    provider: 'magpie',
-    model: 'local-31-99/qwen3.8-27b',
-    file: path.join(os.homedir(), '.dsh', 'finish-line.persona.md'),
+    /**
+     * 蒸馏人格文件，随本仓库分发（不存在 = 安装损坏，直接报错，不用内置
+     * 假人格兜底）。
+     */
+    file: path.join(PLUGIN_DIR, 'persona', 'persona.md'),
     maxContextBytes: 24576,
     maxOutputTokens: 700,
     timeoutMs: 90000,
     retries: 1,
     /** 子代理模式下写进提示词的规则（session 模式用 PERSONA_RULES）。 */
     subagentRules: [
-      '- 你是子代理：不能向用户提问（宿主会拒绝），也不要把问题推回父会话。',
-      '- 遇到拿不准的决定，按上面的风格直接定，并在最终汇报里写一句「我替你定了什么、为什么」。',
+      '- 你是收尾子代理：不能向用户提问（宿主会拒绝），也不要把问题推回父会话。',
+      '- 平时拿得准的决定，按你的工程判断直接定，并在最终汇报里写清「我替你定了什么、为什么」。',
+      '- 但遇到本该由用户拍板的事——业务取舍、要不要扩范围、不可逆操作、改不动方向——在汇报末尾单独一行写「NEED-DECISION：」加具体卡点和候选项，然后停下。蒸馏人格会替你拍板，结果会发回给你，按拍板继续做完，不要回头再问。',
       '- 不要复述任务、不要空转；干完就停，产出要能让下一个人直接接手。',
     ].join('\n'),
   },
   logFile: path.join(os.homedir(), '.dsh', 'logs', 'finish-line.log'),
 }
-
-/** 内置默认人格（还没有蒸馏产物时的兜底）。 */
-const DEFAULT_PERSONA = [
-  '你现在代替用户本人拍板。用户是一位资深工程师/产品负责人，风格如下：',
-  '- 直接、务实、先要结论；不绕弯，不说套话。',
-  '- 按业务事实判断，不要假兼容、假兜底；能删就删，别为了兼容留垃圾。',
-  '- 偏好最小改动、可回滚、分批提交；对不可逆操作谨慎。',
-  '- 代码要组件化、模块化、可维护；重复逻辑收口到公共模块。',
-  '- 时间敏感：小问题不要拖成长会；卡住就如实说卡在哪。',
-  '- 遇到「继续/停/选方案」这类问题，倾向选能推进主线、风险最小、改动最小的那个。',
-].join('\n')
 
 /** 代答的系统提示（人格文件之后追加）。 */
 const PERSONA_RULES = [
@@ -177,16 +181,12 @@ export function resolveConfig(config = {}) {
     subagent: {
       provider: nonEmptyString(subagent.provider, 'spawn'),
       agentOptions: subagent.agentOptions !== null && typeof subagent.agentOptions === 'object' ? subagent.agentOptions : null,
-      decideOnStuck: subagent.decideOnStuck !== false,
       decideKeywords: Array.isArray(subagent.decideKeywords) && subagent.decideKeywords.length > 0
         ? subagent.decideKeywords.map(String)
         : DEFAULTS.subagent.decideKeywords,
       decideMaxWaitMs: Math.round(clampNumber(subagent.decideMaxWaitMs, 60000, 3600000, DEFAULTS.subagent.decideMaxWaitMs)),
     },
     persona: {
-      enabled: persona.enabled !== false,
-      provider: nonEmptyString(persona.provider, DEFAULTS.persona.provider),
-      model: nonEmptyString(persona.model, DEFAULTS.persona.model),
       file: nonEmptyString(persona.file, DEFAULTS.persona.file),
       maxContextBytes: Math.round(clampNumber(persona.maxContextBytes, 4096, 262144, DEFAULTS.persona.maxContextBytes)),
       maxOutputTokens: Math.round(clampNumber(persona.maxOutputTokens, 128, 4096, DEFAULTS.persona.maxOutputTokens)),
@@ -226,9 +226,25 @@ export function stageTitle(stage, rootTitle) {
   return `${head}${tail}`
 }
 
-/** 首条提示就只是那一步的原话；上下文/人格一律不预置。 */
+/**
+ * 首条提示就只是那一步的原话（session 执行器用：那边的人格介入形态是
+ * user-questions 代答）；上下文/人格一律不预置。
+ */
 export function buildStagePrompt(stage) {
   return stage.prompt
+}
+
+/**
+ * subagent 执行器的首条提示：步骤原话 + NEED-DECISION 协议。
+ * 子代理不能向用户提问（宿主拒绝），协议告诉它「该用户拍板的事」
+ * 要在汇报末尾单独喊 NEED-DECISION 并停下——人格必然替它拍板，
+ * 决定发回同一个子代理继续。没有这段协议，「必然介入」就退化成
+ * 靠子代理碰巧说出关键词。
+ * @param {object} stage 收尾步骤
+ * @param {string} rules NEED-DECISION 协议文本（DEFAULTS.persona.subagentRules）
+ */
+export function buildSubagentPrompt(stage, rules) {
+  return `${stage.prompt}\n\n${rules}`
 }
 
 /** 把问题裁剪成给模型看的形状（不出卖宿主内部对象）。 */
@@ -599,9 +615,11 @@ export function apply(ctx, config = {}) {
       const stage = cfg.stages[stageIndex]
       const abort = new AbortController()
       aborts.set(chain.rootId, abort)
-      // 首条提示就一句原话；不传 agentOptions：spawn 继承父会话的满血模型。
+      // 步骤原话 + NEED-DECISION 协议（子代理不能提问，需要用户拍板的事
+      // 靠协议喊出来，人格必然接手）；不传 agentOptions：spawn 继承父会话
+      // 的满血模型。
       const request = {
-        prompt: [{ type: 'text', text: buildStagePrompt(stage) }],
+        prompt: [{ type: 'text', text: buildSubagentPrompt(stage, cfg.persona.subagentRules) }],
         parent,
         cwd: chain.cwd,
         maxDepth: 1,
@@ -635,14 +653,19 @@ export function apply(ctx, config = {}) {
         return
       }
 
-      // 子代理定不了 → 才把人格请出来（一次模型调用，平时零开销）。
-      if (cfg.subagent.decideOnStuck && needsDecision(summary, cfg.subagent.decideKeywords)) {
+      // 子代理定不了 → 必然把人格请出来拍板，决定发回同一个子代理（非开关）。
+      // 拍板失败不作假成功：链标记 failed，把卡点原样留在日志里等人看。
+      if (needsDecision(summary, cfg.subagent.decideKeywords)) {
         log(`收尾第 ${stageIndex + 1} 步子代理说定不了，请人格拍板`)
         try {
           const resumed = await decideAndContinue(chain, activation.childId, stage, summary, abort.signal)
           if (resumed !== '') log(`收尾第 ${stageIndex + 1} 步（人格拍板后）输出=${resumed.slice(0, 4000)}`)
         } catch (error) {
-          log(`人格拍板失败（${stage.id}）：${describeError(error)}`)
+          chain.status = 'failed'
+          chain.updatedAt = Date.now()
+          persist()
+          log(`人格拍板失败，收尾链 ${chain.rootId} 在第 ${stageIndex + 1} 步停下（不作假成功）。卡点原文：${summary.slice(0, 2000)}；原因：${describeError(error)}`)
+          return
         }
       }
 
@@ -724,7 +747,18 @@ export function apply(ctx, config = {}) {
       '直接给可执行的决定，1-3 句；不要解释你的人格、不要 JSON、不要复述问题。',
     ].join('\n')
     const userText = `收尾步骤：${stage.id}\n子代理说自己卡住了，它的汇报：\n${summary.slice(0, 4000)}\n\n请给出一句可以执行的决定。`
-    return (await streamPersonaLlm(system, userText, session)).trim()
+    let lastError
+    for (let attempt = 0; attempt <= cfg.persona.retries; attempt += 1) {
+      try {
+        const text = (await streamPersonaLlm(system, userText, session)).trim()
+        if (text !== '') return text
+        throw new Error('人格输出为空')
+      } catch (error) {
+        lastError = error
+        log(`人格拍板第 ${attempt + 1} 次失败：${describeError(error)}`)
+      }
+    }
+    throw lastError ?? new Error('人格拍板失败')
   }
 
   /* ---------------- 执行器 B：新会话（可见，可代答） ---------------- */
@@ -814,22 +848,18 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  /* ---------------- 人格（文件 + 内置兜底） ---------------- */
+  /* ---------------- 人格（蒸馏产物，随仓库存在） ---------------- */
 
   function readPersona() {
     if (personaCache !== undefined) return personaCache
+    let text = ''
     try {
-      const text = fs.readFileSync(cfg.persona.file, 'utf8').trim()
-      if (text !== '') {
-        personaCache = text
-        return personaCache
-      }
+      text = fs.readFileSync(cfg.persona.file, 'utf8').trim()
     } catch (error) {
-      if (!(error && typeof error === 'object' && error.code === 'ENOENT')) {
-        log(`读人格文件失败（用内置人格）：${describeError(error)}`)
-      }
+      throw new Error(`人格文件缺失/不可读（${cfg.persona.file}）：${describeError(error)}。本插件的人格随仓库分发，丢了这个文件等于安装损坏`)
     }
-    personaCache = DEFAULT_PERSONA
+    if (text === '') throw new Error(`人格文件是空的：${cfg.persona.file}`)
+    personaCache = text
     return personaCache
   }
 
@@ -869,9 +899,25 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  async function resolveReasoningEffort(llm) {
+  /**
+   * 人格的推理路由：跟宿主 agentDefaultModel 的当前选择（GUI 里选的默认模型）。
+   * 不配置独立路由、不指向任何特定机器；换环境自动换路由。
+   */
+  function personaRoute() {
+    const defaultModel = ctx.get('agentDefaultModel')
+    if (defaultModel === undefined || typeof defaultModel.currentSelection !== 'function') {
+      throw new Error('缺少 agentDefaultModel 服务，人格拿不到当前模型路由')
+    }
+    const selection = defaultModel.currentSelection()
+    if (typeof selection?.provider !== 'string' || selection.provider === '' || typeof selection?.model !== 'string' || selection.model === '') {
+      throw new Error('agentDefaultModel 当前没有可用的 provider/model 选择')
+    }
+    return { provider: selection.provider, model: selection.model }
+  }
+
+  async function resolveReasoningEffort(llm, route) {
     try {
-      await llm.resolveCallConfig({ provider: cfg.persona.provider, model: cfg.persona.model, reasoningEffort: 'off' })
+      await llm.resolveCallConfig({ provider: route.provider, model: route.model, reasoningEffort: 'off' })
       return 'off'
     } catch {
       return undefined
@@ -887,13 +933,14 @@ export function apply(ctx, config = {}) {
   async function streamPersonaLlm(system, userText, session) {
     const llm = ctx.get('llm')
     if (llm === undefined) throw new Error('缺少 llm 服务')
-    const effort = await resolveReasoningEffort(llm)
+    const route = personaRoute()
+    const effort = await resolveReasoningEffort(llm, route)
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(new Error('persona timeout')), cfg.persona.timeoutMs)
     try {
       const options = {
-        provider: cfg.persona.provider,
-        model: cfg.persona.model,
+        provider: route.provider,
+        model: route.model,
         messages: [buildUserMessage(userText)],
         system,
         maxTokens: cfg.persona.maxOutputTokens,
@@ -957,12 +1004,12 @@ export function apply(ctx, config = {}) {
     }
   })
 
-  // 人格代答：只在「新会话」执行器的收尾会话里抢答；子代理模式走提示词，
-  // 其它会话一律 next()，绝不干扰任务会话。
+  // 人格代答：只在「新会话」执行器的收尾会话里抢答（必然业务，无开关）；
+  // 子代理模式走 NEED-DECISION 协议 + 拍板发回，其它会话一律 next()，
+  // 绝不干扰任务会话。
   ctx.on('user-questions/request', async (request, next) => {
     try {
       if (cfg.executor !== 'session') return next()
-      if (cfg.persona.enabled !== true) return next()
       const agent = request.agent
       if (agent === undefined) return next()
       const sessionId = agent.session?.id
@@ -989,7 +1036,7 @@ export function apply(ctx, config = {}) {
 
   ctx.effect(() => {
     loadState()
-    log(`已启用（executor=${cfg.executor}，quiet=${cfg.quietMs}ms，persona=${cfg.persona.enabled ? 'on' : 'off'}，dryRun=${cfg.dryRun}）`)
+    log(`已启用（executor=${cfg.executor}，quiet=${cfg.quietMs}ms，persona=${cfg.persona.file}，dryRun=${cfg.dryRun}）`)
     return () => {
       for (const timer of timers.values()) clearTimeout(timer)
       timers.clear()

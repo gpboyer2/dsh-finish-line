@@ -70,10 +70,10 @@ On a first install, run with `dryRun: true`: logs only, no code changes. Turn it
 | --- | --- |
 | Auto trigger | Acts only when all four trigger conditions hold; no fuzzy matching. |
 | Two serial steps | The next step starts only after the previous step's subagent ends; order is changed in `stages`. |
-| Empty-conversation subagents | No inherited chat history, no preset persona, no injected context. |
+| Empty-conversation subagents | No inherited chat history or injected context; only the step sentence plus the NEED-DECISION protocol. |
 | Model inheritance | `agentOptions: null`; keeps the parent session's model and reasoning tier. |
 | Two executors | `subagent` (default, not listed in the sidebar) or `session` (two new sessions, visible in the sidebar). |
-| Persona on demand | Calls the persona model once only when a subagent reports "can't decide / needs a decision"; zero cost otherwise. |
+| Persona is mandatory | When a subagent reports "can't decide / needs a decision", the distilled persona **always** decides and the decision is sent back to the same subagent; in `session` mode the persona **always** answers stage-session questions. **No switch — this is business logic, not an option.** |
 | Resume | Chain state on disk, kept 7 days, at most 300 entries. |
 | dry-run | Writes the decision and logs only; starts no subagent, changes no code. |
 | Zero dependencies | Only host services injected by DSH and Node built-in modules. |
@@ -105,27 +105,34 @@ Override the plugin line's `config:` in `~/.dsh/profiles/desktop/cordis.patch.ym
 | `stages` | Two verbatim sentences | `[{ id, titlePrefix, prompt }]`, one sentence per step; default titles `收尾② 组件化整理` / `收尾③ 批判提交`. Order and wording are changed here. |
 | `subagent.provider` | `spawn` | In-process subagent backend name. |
 | `subagent.agentOptions` | `null` | `null` = not passed; inherits the parent session's model. |
-| `subagent.decideOnStuck` | `true` | Calls the persona only when stuck. |
-| `subagent.decideKeywords` | See source | Which phrases count as "can't decide". |
-| `subagent.decideMaxWaitMs` | `600000` | Upper bound for waiting on that turn after the decision is sent back. |
-| `persona.enabled` | `true` | Master switch for persona answering / deciding. |
-| `persona.provider` / `model` | `magpie` / `local-31-99/qwen3.8-27b` | Model route used for answering. |
-| `persona.file` | `~/.dsh/finish-line.persona.md` | Persona file; the built-in one is used when it does not exist. |
+| `subagent.decideKeywords` | See source | Which reports count as "can't decide" (includes `NEED-DECISION`). A hit **always** triggers the persona; no switch exists. |
+| `subagent.decideMaxWaitMs` | `600000` | Upper bound for waiting on that turn after the decision is sent back. If the decision fails, the chain is marked `failed`, the stuck report is logged verbatim; no silent skip. |
+| `persona.file` | In-repo `persona/persona.md` | Distilled persona artifact shipped with this repository. Missing or empty = broken install, hard error; **no built-in fake persona fallback**. |
+| `persona.maxContextBytes` / `maxOutputTokens` | `24576` / `700` | Session digest cap / per-call output cap for `session`-mode answering. |
+| `persona.timeoutMs` / `retries` | `90000` / `1` | Timeout and retries for persona calls. |
+| `persona.subagentRules` | See source | NEED-DECISION protocol injected into subagents. |
 | `logFile` | `~/.dsh/logs/finish-line.log` | Log location. |
 
-The built-in persona is: direct, minimal change, no fake compatibility, batched commits, cautious with irreversible operations. To replace it, write a distilled persona to `~/.dsh/finish-line.persona.md` to override it. No code change.
+**Four non-negotiable rules for the persona (fixed by the user, 2026-11-25):**
+
+1. When subagent A (refactor) or B (critical commit) needs a user decision, the distilled persona **must** decide, and the decision is sent back to the same subagent. Triggered by the `NEED-DECISION` protocol, not by any switch.
+2. The persona is **not bound to any machine-specific offline model**. Its inference route follows the host's current `agentDefaultModel` selection (the default model chosen in the GUI); changing environments changes the route automatically.
+3. The distilled artifact `persona/persona.md` **lives in this repository** — installed with the plugin, never a stray file under `~/.dsh`, and there is no "use a built-in placeholder until distilled" path.
+4. Decision/answering failures are never faked as success: in `subagent` mode the chain stops and logs the stuck report; in `session` mode it hands back to a human.
+
+The persona file is a **decision-criteria library**, not a character biography — model the user's pushback as intent + satisfaction criteria + trigger condition, each backed by corpus evidence. To re-distill, just edit `persona/persona.md`; no code change needed.
 
 ## Two executors
 
 | | `subagent` (default) | `session` |
 | --- | --- | --- |
-| Form | In-process spawn, empty conversation, one sentence | Two new top-level sessions, visible in the sidebar, one sentence |
+| Form | In-process spawn, empty conversation, step sentence + NEED-DECISION protocol | Two new top-level sessions, visible in the sidebar, one sentence |
 | Model | Inherits the parent session's model | Inherits the parent session's preset and model |
 | Visibility | Parent session's subagents directory; not listed in the sidebar | Standalone session in the sidebar; can be taken over at any time |
-| Can't decide | Detects "can't decide" → persona decides, then sends back to the same subagent | `ask_user_question` → persona answers |
-| Can it ask questions | No (host `DELEGATED_CALLER` refuses) | Yes |
+| Can't decide | **Mandatory**: detects "can't decide" → persona decides → decision sent back to the same subagent | **Mandatory**: `ask_user_question` → persona answers |
+| Can it ask questions | No (host `DELEGATED_CALLER` refuses); uses the protocol to emit NEED-DECISION | Yes, intercepted and answered by the persona |
 
-Use `subagent` to save tokens; use `session` to watch and take over at any time.
+Use `subagent` to save tokens; use `session` to watch and take over at any time. The persona is mandatory in both executors; only the form differs.
 
 ## Logs and diagnostics
 
@@ -145,32 +152,34 @@ If it did not trigger, locate the cause from the last log line:
 ## Architecture
 
 ```
-index.js              All plugin logic: trigger checks, chain state machine, subagent spawn, persona decisions, answering
-cordis.patch.yml      bundle patch: inserts the plugin line and supplies default config
-locale/zh.json        Chinese name and one-line description for the plugin market
-locale/en.json        English name and description
-icon.svg              Plugin icon
-test/logic.test.mjs   Pure-logic tests (9)
+index.js                All plugin logic: trigger checks, chain state machine, subagent spawn, persona decisions, answering
+persona/persona.md      Distilled persona artifact (criteria library), shipped with the repository
+cordis.patch.yml        bundle patch: inserts the plugin line and supplies default config
+locale/zh.json          Chinese name and one-line description for the plugin market
+locale/en.json          English name and description
+icon.svg                Plugin icon
+test/logic.test.mjs     Pure-logic tests (13)
 ```
 
-Uses only host services injected via `ctx` (`sessions` / `agents` / `sessionController` / `llm` / `subagents`) and Node built-in modules; no build step; state and logs both live under `~/.dsh`.
+Uses only host services injected via `ctx` (`sessions` / `agents` / `sessionController` / `llm` / `subagents` / `agentDefaultModel`) and Node built-in modules; no build step; state and logs both live under `~/.dsh`.
 
 ## Tests
 
 ```sh
-npm test        # node --test, 9 tests
+npm test        # node --test, 13 tests
 ```
 
-Coverage: config defaults and clamping of invalid values, each step's first prompt matching the configured sentence verbatim, the 80-byte cap on `stageTitle`, detection of "can't decide" signals, validation of question answers (single choice / multiple choice / custom / no options), and tolerant parsing of model output.
+Coverage: config defaults and clamping, persona has no switches (`enabled` / `provider` / `model` / `decideOnStuck` are all absent), persona artifact path is inside the repo, each step's first prompt matching the configured sentence verbatim, NEED-DECISION protocol injection and signal-word alignment, detection of "can't decide" signals, validation of question answers (single choice / multiple choice / custom / no options), tolerant parsing of model output.
 
 ## Limits
 
 - Subagents are not listed in the sidebar. To take over, set `executor: session` or open the parent session's subagents directory.
-- "Can't decide" relies on signal phrases. A false positive costs one extra persona call and does not redo the work.
+- "Can't decide" relies on the protocol + signal phrases. A false positive costs one extra persona call and does not redo the work; a failed decision never passes silently — the chain stops and logs the stuck report.
+- Persona inference uses the host's GUI-selected default model (`agentDefaultModel.currentSelection()`); no machine binding. No default model configured → failed decision logged, chain stops.
 - A large untracked directory also counts as a change. `git status` reports it as "has changes"; commit or clean it first.
 - `session` mode does not answer plan approvals. Questions with `plan-review` intent are not answered; the chain would rather hang and wait for a human.
 - A DSH restart is required. The host half is an in-process module and loads only at startup.
-- Depends on three seams: `ctx.sessions` / `ctx.subagents` / `ctx.llm`. If upstream changes these seams, this plugin has to follow.
+- Depends on host seams: `ctx.sessions` / `ctx.subagents` / `ctx.llm` / `ctx.agentDefaultModel`. If upstream changes these seams, this plugin has to follow.
 
 ## License
 
