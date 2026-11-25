@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Finish Line",
+    "description": "After a task session ends and its queued input is drained, runs the refactor and commit steps in series, as a subagent or a fresh session."
+  }
+}

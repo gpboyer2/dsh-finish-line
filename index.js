@@ -1,0 +1,1002 @@
+/**
+ * dsh-finish-line —— 任务会话结束后的「收尾流水线」
+ *
+ * 用户的一个任务（干活）结束后，本插件自动串行跑两个收尾步骤：
+ *   ① 组件化整理（把公共函数收进 utils，按模块化举一反三）
+ *   ② 批判式提交（调 cc-git-commit、分批推送、审 diff 找隐患/bug/遗漏）
+ *
+ * 两种执行器（config.executor）：
+ *   - `subagent`（默认）：进程内 spawn 子代理。**不传 agentOptions → 继承父会话
+ *     的 provider/model/推理档**（父会话是满血模型，子代理不再被 profile 里的
+ *     27B 默认值拖低）；空对话开始 + 只发两句话，父上下文不会渗进来；子代理
+ *     侧边栏隐藏，要接手在父会话的子代理面板里看。代价：子代理**不能**
+ *     ask_user_question（宿主以 DELEGATED_CALLER 拒绝），所以人格规则写进
+ *     提示词，让它遇到拿不准的自己定。
+ *   - `session`：开两个全新顶层会话（侧边栏可见），老路；这条路才启用
+ *     「人格代答」——拦 user-questions/request，用 persona 模型选答案。
+ *
+ * 规则（用户 2026-11-25 明确要求）：
+ *   - 触发：会话所在目录是 Git 仓库且有改动 → 必然触发；纯问答不触发。
+ *   - 「等所有的话都说完了」：turn/end 之后静默 quietMs 且 inbox 为空才动手。
+ *   - 任务会话本身绝不干预：那里 AI 提问就挂着等人（阻塞式提问时 turn 不会
+ *     结束，链也不会启动）。
+ *   - plan-review（计划审批）不代答，宁可挂住；代答失败一律 next() 交回真人。
+ *
+ * 只用 ctx 注入的宿主服务与 Node 内置模块，link 安装最稳。
+ *
+ * @module dsh-finish-line
+ */
+
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { execFile } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
+
+/** 插件 id，需与 cordis.patch.yml 的 id 一致。 */
+export const name = 'dsh-finish-line'
+
+/** 依赖的宿主服务（subagents 只在 subagent 执行器下需要）。 */
+export const inject = ['sessions', 'agents', 'sessionController', 'llm', 'subagents']
+
+/** 代答消息的 producer-owned source kind（会话格式 v4 要求）。 */
+const SOURCE_KIND = `plugin:${name}`
+
+const STATE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000
+const STATE_MAX_CHAINS = 300
+
+/** 默认配置。 */
+export const DEFAULTS = {
+  enabled: true,
+  /** `subagent`（默认，省 token、满血、空对话）或 `session`（新会话，侧栏可见）。 */
+  executor: 'subagent',
+  /** 只写日志、不真跑（首次安装先观察用）。 */
+  dryRun: false,
+  /** turn/end 之后等多久算「所有的话都说完了」。 */
+  quietMs: 20000,
+  /** 本次会话至少发生过一次工具调用才算「干过活」，纯问答不触发。 */
+  requireToolCall: true,
+  maxChainAgeMs: 6 * 60 * 60 * 1000,
+  gitTimeoutMs: 8000,
+  /** 收尾两步。 */
+  stages: [
+    {
+      id: 'refactor',
+      titlePrefix: '收尾② 组件化整理',
+      prompt: 'git diff 将公共函数整理到 utils 相关模块中，要求在组件化、模块化的指导思路下举一反三，以此类推；',
+    },
+    {
+      id: 'commit',
+      titlePrefix: '收尾③ 批判提交',
+      prompt: '调用技能 cc-git-commit 同步并推送代码，分批，注意 diff 的过程中批判下、看看有没有隐患、bug、遗漏；',
+    },
+  ],
+  subagent: {
+    /** 进程内 spawn 后端名。 */
+    provider: 'spawn',
+    /**
+     * 子代理模型路由。null = 不传 agentOptions，继承父会话的 provider/model/
+     * reasoningEffort（父会话是满血模型时，子代理也是）。
+     */
+    agentOptions: null,
+    /** 卡住时是否把人格请出来（只在子代理自己说「定不了」时才调用，平时零开销）。 */
+    decideOnStuck: true,
+    /** 子代理汇报里出现这些信号，才认为它卡住了。 */
+    decideKeywords: [
+      '无法继续',
+      '无法确定',
+      '不确定',
+      '需要确认',
+      '需要决定',
+      '需要拍板',
+      '请你决定',
+      'waiting for confirmation',
+      'NEED-DECISION',
+    ],
+    /** 注入人格后，等它这一轮结束的上限。 */
+    decideMaxWaitMs: 600000,
+  },
+  persona: {
+    enabled: true,
+    provider: 'magpie',
+    model: 'local-31-99/qwen3.8-27b',
+    file: path.join(os.homedir(), '.dsh', 'finish-line.persona.md'),
+    maxContextBytes: 24576,
+    maxOutputTokens: 700,
+    timeoutMs: 90000,
+    retries: 1,
+    /** 子代理模式下写进提示词的规则（session 模式用 PERSONA_RULES）。 */
+    subagentRules: [
+      '- 你是子代理：不能向用户提问（宿主会拒绝），也不要把问题推回父会话。',
+      '- 遇到拿不准的决定，按上面的风格直接定，并在最终汇报里写一句「我替你定了什么、为什么」。',
+      '- 不要复述任务、不要空转；干完就停，产出要能让下一个人直接接手。',
+    ].join('\n'),
+  },
+  logFile: path.join(os.homedir(), '.dsh', 'logs', 'finish-line.log'),
+}
+
+/** 内置默认人格（还没有蒸馏产物时的兜底）。 */
+const DEFAULT_PERSONA = [
+  '你现在代替用户本人拍板。用户是一位资深工程师/产品负责人，风格如下：',
+  '- 直接、务实、先要结论；不绕弯，不说套话。',
+  '- 按业务事实判断，不要假兼容、假兜底；能删就删，别为了兼容留垃圾。',
+  '- 偏好最小改动、可回滚、分批提交；对不可逆操作谨慎。',
+  '- 代码要组件化、模块化、可维护；重复逻辑收口到公共模块。',
+  '- 时间敏感：小问题不要拖成长会；卡住就如实说卡在哪。',
+  '- 遇到「继续/停/选方案」这类问题，倾向选能推进主线、风险最小、改动最小的那个。',
+].join('\n')
+
+/** 代答的系统提示（人格文件之后追加）。 */
+const PERSONA_RULES = [
+  '',
+  '硬性规则：',
+  '1. 只能从给出的 options 里选 label，不要发明新选项；只有所有选项都不合适，才用 custom 补充理由。',
+  '2. 单选：selected 恰好一个；给 custom 时 selected 置空（custom 覆盖单选）。',
+  '3. 多选：selected 可多个，可再补 custom。',
+  '4. 没有 options 的问题（纯填空）：selected 为空，只能给 custom。',
+  '5. 只输出一个 JSON 对象，不要 Markdown、不要解释：',
+  '   {"answers":[{"id":"<问题id>","selected":["<选项label>"],"custom":"<可选>"}]}',
+  '6. 每个问题的 id 必须恰好出现一次；不确定时选最保守的那个选项，并在 custom 里写一句为什么。',
+].join('\n')
+
+/* ------------------------------------------------------------------ *
+ * 配置与工具
+ * ------------------------------------------------------------------ */
+
+function clampNumber(value, min, max, fallback) {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return fallback
+  return Math.min(max, Math.max(min, parsed))
+}
+
+function nonEmptyString(value, fallback) {
+  return typeof value === 'string' && value.trim() !== '' ? value.trim() : fallback
+}
+
+/** 校验并合并默认配置（导出便于单测）。 */
+export function resolveConfig(config = {}) {
+  const merged = { ...DEFAULTS, ...(config && typeof config === 'object' ? config : {}) }
+  const persona = { ...DEFAULTS.persona, ...(merged.persona && typeof merged.persona === 'object' ? merged.persona : {}) }
+  const subagent = { ...DEFAULTS.subagent, ...(merged.subagent && typeof merged.subagent === 'object' ? merged.subagent : {}) }
+  const stages = Array.isArray(merged.stages) && merged.stages.length > 0 ? merged.stages : DEFAULTS.stages
+  return {
+    enabled: merged.enabled !== false,
+    executor: merged.executor === 'session' ? 'session' : 'subagent',
+    dryRun: merged.dryRun === true,
+    quietMs: Math.round(clampNumber(merged.quietMs, 3000, 600000, DEFAULTS.quietMs)),
+    requireToolCall: merged.requireToolCall !== false,
+    maxChainAgeMs: Math.round(clampNumber(merged.maxChainAgeMs, 60000, 7 * 24 * 3600 * 1000, DEFAULTS.maxChainAgeMs)),
+    gitTimeoutMs: Math.round(clampNumber(merged.gitTimeoutMs, 1000, 60000, DEFAULTS.gitTimeoutMs)),
+    stages: stages
+      .filter((stage) => stage && typeof stage === 'object' && typeof stage.prompt === 'string' && stage.prompt.trim() !== '')
+      .map((stage, index) => ({
+        id: nonEmptyString(stage.id, `stage-${index + 1}`),
+        titlePrefix: nonEmptyString(stage.titlePrefix, `收尾${index + 2}`),
+        prompt: stage.prompt.trim(),
+      })),
+    subagent: {
+      provider: nonEmptyString(subagent.provider, 'spawn'),
+      agentOptions: subagent.agentOptions !== null && typeof subagent.agentOptions === 'object' ? subagent.agentOptions : null,
+      decideOnStuck: subagent.decideOnStuck !== false,
+      decideKeywords: Array.isArray(subagent.decideKeywords) && subagent.decideKeywords.length > 0
+        ? subagent.decideKeywords.map(String)
+        : DEFAULTS.subagent.decideKeywords,
+      decideMaxWaitMs: Math.round(clampNumber(subagent.decideMaxWaitMs, 60000, 3600000, DEFAULTS.subagent.decideMaxWaitMs)),
+    },
+    persona: {
+      enabled: persona.enabled !== false,
+      provider: nonEmptyString(persona.provider, DEFAULTS.persona.provider),
+      model: nonEmptyString(persona.model, DEFAULTS.persona.model),
+      file: nonEmptyString(persona.file, DEFAULTS.persona.file),
+      maxContextBytes: Math.round(clampNumber(persona.maxContextBytes, 4096, 262144, DEFAULTS.persona.maxContextBytes)),
+      maxOutputTokens: Math.round(clampNumber(persona.maxOutputTokens, 128, 4096, DEFAULTS.persona.maxOutputTokens)),
+      timeoutMs: Math.round(clampNumber(persona.timeoutMs, 10000, 600000, DEFAULTS.persona.timeoutMs)),
+      retries: Math.round(clampNumber(persona.retries, 0, 3, DEFAULTS.persona.retries)),
+      subagentRules: nonEmptyString(persona.subagentRules, DEFAULTS.persona.subagentRules),
+    },
+    logFile: nonEmptyString(merged.logFile, DEFAULTS.logFile),
+  }
+}
+
+function describeError(error) {
+  return error instanceof Error ? error.message : String(error)
+}
+
+function guardHome() {
+  return process.env.DSH_PROFILE_DIR ?? process.env.DSH_HOME ?? path.join(os.homedir(), '.dsh')
+}
+
+function stateFile() {
+  return path.join(guardHome(), 'finish-line.state.json')
+}
+
+/* ------------------------------------------------------------------ *
+ * 提示词与标题（导出便于单测）
+ * ------------------------------------------------------------------ */
+
+/** 收尾会话标题：「收尾② 组件化整理 ← 原标题」，80 字节内。 */
+export function stageTitle(stage, rootTitle) {
+  const base = (rootTitle ?? '').trim() || '未命名会话'
+  const head = `${stage.titlePrefix} ← `
+  const budget = 80
+  const headBytes = Buffer.byteLength(head, 'utf8')
+  const room = Math.max(4, budget - headBytes)
+  let tail = base
+  while (Buffer.byteLength(tail, 'utf8') > room && tail.length > 0) tail = tail.slice(0, -1)
+  return `${head}${tail}`
+}
+
+/** 首条提示就只是那一步的原话；上下文/人格一律不预置。 */
+export function buildStagePrompt(stage) {
+  return stage.prompt
+}
+
+/** 把问题裁剪成给模型看的形状（不出卖宿主内部对象）。 */
+export function questionsForModel(questions) {
+  return questions.map((question) => ({
+    id: question.id,
+    header: question.header,
+    question: question.question,
+    detail: question.detail,
+    multiSelect: question.multiSelect === true,
+    options: (question.options ?? []).map((option) => ({
+      label: option.label,
+      description: option.description,
+    })),
+  }))
+}
+
+/**
+ * 校验模型给出的答案：每个问题恰好一条、选项 label 必须来自问题本身。
+ * @throws 校验失败时抛错，调用方降级给真人。
+ */
+export function validateAnswers(raw, questions) {
+  if (raw === null || typeof raw !== 'object' || !Array.isArray(raw.answers)) throw new Error('答案不是 {answers:[...]}')
+  const out = []
+  for (const question of questions) {
+    const item = raw.answers.find((entry) => entry && entry.id === question.id)
+    if (item === undefined) throw new Error(`问题 ${question.id} 没有答案`)
+    const options = question.options ?? []
+    const rawSelected = Array.isArray(item.selected) ? item.selected : []
+    const selected = rawSelected.filter((label) => typeof label === 'string' && options.some((option) => option.label === label))
+    const custom = typeof item.custom === 'string' && item.custom.trim() !== '' ? item.custom.trim() : undefined
+    if (options.length === 0) {
+      if (custom === undefined) throw new Error(`问题 ${question.id} 没有选项，需要 custom 文本`)
+      out.push({ id: question.id, selected: [], custom })
+      continue
+    }
+    if (question.multiSelect) {
+      if (selected.length === 0 && custom === undefined) throw new Error(`问题 ${question.id} 是多选，但没选任何项`)
+      out.push({ id: question.id, selected, ...(custom === undefined ? {} : { custom }) })
+      continue
+    }
+    if (custom !== undefined) {
+      out.push({ id: question.id, selected: [], custom })
+      continue
+    }
+    if (selected.length !== 1) throw new Error(`问题 ${question.id} 是单选，需要恰好一个选项`)
+    out.push({ id: question.id, selected })
+  }
+  return { answers: out }
+}
+
+/** 从模型输出里抠出 JSON（容忍 ```json 包裹与前后废话）。 */
+export function parseAnswerJson(text) {
+  const trimmed = (text ?? '').trim()
+  if (trimmed === '') throw new Error('模型没有输出')
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i)
+  const candidate = fenced ? fenced[1].trim() : trimmed
+  const start = candidate.indexOf('{')
+  const end = candidate.lastIndexOf('}')
+  if (start < 0 || end <= start) throw new Error('模型输出里没有 JSON 对象')
+  return JSON.parse(candidate.slice(start, end + 1))
+}
+
+/** 子代理汇报里出现「定不了」的信号，才请人格出场。 */
+export function needsDecision(text, keywords) {
+  if (typeof text !== 'string' || text === '') return false
+  return keywords.some((keyword) => typeof keyword === 'string' && keyword !== '' && text.includes(keyword))
+}
+
+/** 从子代理结果里取纯文本（写日志用）。 */
+export function resultText(result) {
+  try {
+    const blocks = Array.isArray(result?.output) ? result.output : []
+    const text = blocks
+      .filter((block) => block?.type === 'text' && typeof block.text === 'string')
+      .map((block) => block.text)
+      .join('\n')
+      .trim()
+    if (text !== '') return text
+  } catch {
+    // 往下走
+  }
+  return ''
+}
+
+/* ------------------------------------------------------------------ *
+ * 插件入口
+ * ------------------------------------------------------------------ */
+
+/** 宿主插件入口。 */
+export function apply(ctx, config = {}) {
+  const cfg = resolveConfig(config)
+  const chains = new Map()
+  const stageSessions = new Map()
+  const timers = new Map()
+  const toolCalled = new Map()
+  const aborts = new Map()
+  const childWaiters = new Map()
+  let personaCache
+
+  /* ---------------- 日志与状态 ---------------- */
+
+  function log(message) {
+    const line = `[${new Date().toISOString()}] ${message}`
+    try {
+      fs.mkdirSync(path.dirname(cfg.logFile), { recursive: true })
+      fs.appendFileSync(cfg.logFile, `${line}\n`, 'utf8')
+    } catch {
+      // 日志失败不影响主流程
+    }
+    if (cfg.dryRun) console.log(`[finish-line] ${message}`)
+  }
+
+  function normalizeChain(raw) {
+    return {
+      rootId: String(raw.rootId ?? ''),
+      cwd: String(raw.cwd ?? ''),
+      workspaceId: typeof raw.workspaceId === 'string' ? raw.workspaceId : undefined,
+      rootTitle: String(raw.rootTitle ?? ''),
+      stageIndex: Number.isFinite(Number(raw.stageIndex)) ? Number(raw.stageIndex) : 0,
+      currentSessionId: String(raw.currentSessionId ?? ''),
+      sessions: Array.isArray(raw.sessions) ? raw.sessions.map(String) : [],
+      status: raw.status === 'done' || raw.status === 'failed' ? raw.status : 'running',
+      startedAt: Number.isFinite(Number(raw.startedAt)) ? Number(raw.startedAt) : 0,
+      updatedAt: Number.isFinite(Number(raw.updatedAt)) ? Number(raw.updatedAt) : 0,
+    }
+  }
+
+  function loadState() {
+    let parsed
+    try {
+      parsed = JSON.parse(fs.readFileSync(stateFile(), 'utf8'))
+    } catch (error) {
+      if (error && typeof error === 'object' && error.code === 'ENOENT') return
+      log(`读取状态失败（忽略并重建）：${describeError(error)}`)
+      return
+    }
+    const rows = parsed && typeof parsed === 'object' ? parsed.chains : undefined
+    if (rows === null || typeof rows !== 'object') return
+    const now = Date.now()
+    for (const [rootId, raw] of Object.entries(rows)) {
+      const chain = normalizeChain({ ...(raw ?? {}), rootId })
+      if (chain.rootId === '' || now - chain.updatedAt > STATE_RETENTION_MS) continue
+      chains.set(chain.rootId, chain)
+      for (const sessionId of chain.sessions) if (sessionId !== '') stageSessions.set(sessionId, chain.rootId)
+    }
+  }
+
+  function persist() {
+    const now = Date.now()
+    const rows = [...chains.values()]
+      .filter((chain) => now - chain.updatedAt <= STATE_RETENTION_MS)
+      .sort((left, right) => right.updatedAt - left.updatedAt)
+      .slice(0, STATE_MAX_CHAINS)
+    try {
+      const file = stateFile()
+      fs.mkdirSync(path.dirname(file), { recursive: true })
+      const temp = `${file}.${process.pid}.tmp`
+      fs.writeFileSync(temp, `${JSON.stringify({ version: 1, chains: Object.fromEntries(rows.map((chain) => [chain.rootId, chain])) }, null, 2)}\n`, 'utf8')
+      fs.renameSync(temp, file)
+    } catch (error) {
+      log(`写状态失败：${describeError(error)}`)
+    }
+  }
+
+  /* ---------------- 宿主服务 ---------------- */
+
+  function sessionsService() {
+    return ctx.get('sessions')
+  }
+
+  function liveAgent(sessionId) {
+    const agents = ctx.get('agents')
+    if (agents === undefined || typeof agents.get !== 'function') return undefined
+    return agents.get(sessionId)
+  }
+
+  function sessionCwd(session) {
+    try {
+      const workingDirectory = ctx.get('workingDirectory')
+      if (workingDirectory !== undefined && typeof workingDirectory.get === 'function') {
+        const resolved = workingDirectory.get(session)
+        if (typeof resolved === 'string' && resolved !== '') return resolved
+      }
+    } catch {
+      // 退回 header
+    }
+    return session.header.cwd ?? process.cwd()
+  }
+
+  function workspaceOf(session) {
+    try {
+      const registry = ctx.get('workspaceRegistry')
+      if (registry === undefined || typeof registry.list !== 'function') return undefined
+      for (const workspace of registry.list()) {
+        if (Array.isArray(workspace.sessionIds) && workspace.sessionIds.includes(session.id)) return workspace
+      }
+    } catch {
+      // 没有工作区服务时退回 cwd
+    }
+    return undefined
+  }
+
+  function selectedPreset(session) {
+    try {
+      const selected = ctx.get('sessionProjections')?.stateOf(session, 'agentPreset')
+      if (typeof selected === 'string' && selected !== '') return selected
+    } catch {
+      // 退回 header
+    }
+    return session.header.agentPreset
+  }
+
+  function sessionTitle(session) {
+    try {
+      const title = ctx.get('sessionProjections')?.stateOf(session, 'title')
+      if (typeof title === 'string' && title !== '') return title
+    } catch {
+      // 退回空标题
+    }
+    return ''
+  }
+
+  function inboxIdle(session) {
+    const agent = liveAgent(session.id)
+    if (agent === undefined) return true
+    const nextTurn = Array.isArray(agent.inbox?.nextTurn) ? agent.inbox.nextTurn.length : 0
+    const nextStep = Array.isArray(agent.inbox?.nextStep) ? agent.inbox.nextStep.length : 0
+    return nextTurn === 0 && nextStep === 0
+  }
+
+  function hasToolCall(session) {
+    if (toolCalled.get(session.id) === true) return true
+    try {
+      const events = Array.isArray(session.events) ? session.events : []
+      for (let index = events.length - 1; index >= 0 && index >= events.length - 300; index -= 1) {
+        if (events[index]?.type === 'tool/call') {
+          toolCalled.set(session.id, true)
+          return true
+        }
+      }
+    } catch {
+      // 读不到就从没有算
+    }
+    return false
+  }
+
+  /* ---------------- git ---------------- */
+
+  function runGit(cwd, args) {
+    return new Promise((resolve) => {
+      execFile('git', ['-C', cwd, ...args], { timeout: cfg.gitTimeoutMs, maxBuffer: 1 << 20 }, (error, stdout) => {
+        resolve(error ? null : stdout)
+      })
+    })
+  }
+
+  async function gitInfo(cwd) {
+    if (typeof cwd !== 'string' || cwd === '') return { repo: false, dirty: false }
+    const inside = await runGit(cwd, ['rev-parse', '--is-inside-work-tree'])
+    if (inside === null || inside.trim() !== 'true') return { repo: false, dirty: false }
+    const [status, branch, stat] = await Promise.all([
+      runGit(cwd, ['status', '--porcelain=v1']),
+      runGit(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']),
+      runGit(cwd, ['diff', '--stat', 'HEAD']),
+    ])
+    const porcelain = (status ?? '').trim()
+    return {
+      repo: true,
+      dirty: porcelain !== '',
+      status: porcelain,
+      branch: (branch ?? '').trim(),
+      stat: (stat ?? '').trim(),
+    }
+  }
+
+  /* ---------------- 链 ---------------- */
+
+  function isStageSession(sessionId) {
+    return stageSessions.has(sessionId)
+  }
+
+  function scheduleCheck(session) {
+    const previous = timers.get(session.id)
+    if (previous !== undefined) clearTimeout(previous)
+    const timer = setTimeout(() => {
+      timers.delete(session.id)
+      void evaluate(session).catch((error) => log(`评估会话 ${session.id} 失败：${describeError(error)}`))
+    }, cfg.quietMs)
+    timer.unref?.()
+    timers.set(session.id, timer)
+  }
+
+  async function evaluate(stale) {
+    const session = sessionsService()?.get(stale.id) ?? stale
+    if (session.header.origin === 'subagent') return
+
+    const chainRootId = stageSessions.get(session.id)
+    if (chainRootId !== undefined) {
+      await advance(chainRootId, session)
+      return
+    }
+    if (chains.has(session.id)) return
+    if (!inboxIdle(session)) {
+      log(`会话 ${session.id} 还有排队输入，等它跑完再判断`)
+      return
+    }
+    if (cfg.requireToolCall && !hasToolCall(session)) return
+
+    const cwd = sessionCwd(session)
+    const git = await gitInfo(cwd)
+    if (!git.repo) {
+      log(`会话 ${session.id} 不在 Git 仓库（${cwd}），不触发收尾`)
+      return
+    }
+    if (!git.dirty) {
+      log(`会话 ${session.id} 工作区干净（${cwd}），不触发收尾`)
+      return
+    }
+    if (cfg.dryRun) {
+      log(`[dry-run] 会话 ${session.id} 在 ${cwd} 有改动（${git.status.split('\n').length} 项），本该启动收尾链（${cfg.executor}）`)
+      return
+    }
+    await startChain(session, cwd, git)
+  }
+
+  async function startChain(root, cwd, git) {
+    const chain = {
+      rootId: root.id,
+      cwd,
+      workspaceId: workspaceOf(root)?.id,
+      rootTitle: sessionTitle(root),
+      stageIndex: 0,
+      currentSessionId: '',
+      sessions: [],
+      status: 'running',
+      startedAt: Date.now(),
+      updatedAt: Date.now(),
+    }
+    chains.set(root.id, chain)
+    persist()
+    log(`启动收尾链 root=${root.id} cwd=${cwd} 改动=${git.status.split('\n').length}项 执行器=${cfg.executor}`)
+    if (cfg.executor === 'subagent') {
+      void runSubagentChain(chain).catch((error) => {
+        chain.status = 'failed'
+        chain.updatedAt = Date.now()
+        persist()
+        log(`子代理收尾链失败：${describeError(error)}`)
+      })
+      return
+    }
+    await createStageSession(chain)
+  }
+
+  /* ---------------- 执行器 A：子代理（默认） ---------------- */
+
+  async function runSubagentChain(chain) {
+    const subagents = ctx.get('subagents')
+    if (subagents === undefined || typeof subagents.startActivation !== 'function') throw new Error('缺少 subagents 服务')
+    for (let stageIndex = 0; stageIndex < cfg.stages.length; stageIndex += 1) {
+      chain.stageIndex = stageIndex
+      chain.updatedAt = Date.now()
+      persist()
+
+      const parent = liveAgent(chain.rootId)
+      if (parent === undefined) throw new Error(`父会话 ${chain.rootId} 的 agent 已不在线`)
+      const root = sessionsService()?.get(chain.rootId)
+      const stage = cfg.stages[stageIndex]
+      const abort = new AbortController()
+      aborts.set(chain.rootId, abort)
+      // 首条提示就一句原话；不传 agentOptions：spawn 继承父会话的满血模型。
+      const request = {
+        prompt: [{ type: 'text', text: buildStagePrompt(stage) }],
+        parent,
+        cwd: chain.cwd,
+        maxDepth: 1,
+      }
+      const preset = root === undefined ? undefined : selectedPreset(root)
+      if (preset !== undefined && preset !== '') request.agentPreset = preset
+      if (cfg.subagent.agentOptions !== null) request.agentOptions = cfg.subagent.agentOptions
+
+      const activation = await subagents.startActivation({
+        provider: cfg.subagent.provider,
+        label: `${stage.titlePrefix} · ${chain.rootTitle || chain.rootId}`.slice(0, 60),
+        request,
+        signal: abort.signal,
+        delivery: 'caller',
+      })
+      chain.currentSessionId = activation.childId
+      chain.sessions.push(activation.childId)
+      chain.updatedAt = Date.now()
+      persist()
+      log(`收尾第 ${stageIndex + 1} 步子代理已启动 ${activation.childId}（${stage.id}）`)
+
+      const result = await activation.result
+      const summary = resultText(result)
+      log(`收尾第 ${stageIndex + 1} 步结束 stopReason=${String(result.stopReason)} 输出=${summary === '' ? '（空）' : summary.slice(0, 4000)}`)
+      if (result.diagnostic !== undefined) log(`收尾第 ${stageIndex + 1} 步诊断：${String(result.diagnostic)}`)
+      if (result.stopReason !== 'completed') {
+        chain.status = 'failed'
+        chain.updatedAt = Date.now()
+        persist()
+        log(`收尾链 ${chain.rootId} 在第 ${stageIndex + 1} 步停止（${String(result.stopReason)}）`)
+        return
+      }
+
+      // 子代理定不了 → 才把人格请出来（一次模型调用，平时零开销）。
+      if (cfg.subagent.decideOnStuck && needsDecision(summary, cfg.subagent.decideKeywords)) {
+        log(`收尾第 ${stageIndex + 1} 步子代理说定不了，请人格拍板`)
+        try {
+          const resumed = await decideAndContinue(chain, activation.childId, stage, summary, abort.signal)
+          if (resumed !== '') log(`收尾第 ${stageIndex + 1} 步（人格拍板后）输出=${resumed.slice(0, 4000)}`)
+        } catch (error) {
+          log(`人格拍板失败（${stage.id}）：${describeError(error)}`)
+        }
+      }
+
+      chain.updatedAt = Date.now()
+      persist()
+    }
+    aborts.delete(chain.rootId)
+    chain.status = 'done'
+    chain.updatedAt = Date.now()
+    persist()
+    log(`收尾链 ${chain.rootId} 全部完成（${chain.sessions.length} 个子代理）`)
+  }
+
+  /** 把人格的决定发回同一个子代理，等它这一轮跑完。 */
+  async function decideAndContinue(chain, childId, stage, summary, signal) {
+    const subagents = ctx.get('subagents')
+    const parent = liveAgent(chain.rootId)
+    if (subagents === undefined || parent === undefined) throw new Error('父会话或 subagents 不可用')
+    const session = sessionsService()?.get(childId) ?? sessionsService()?.get(chain.rootId)
+    const decision = await personaDecide(stage, summary, session)
+    if (decision === '') throw new Error('人格没有给出决定')
+    const wait = waitChildTurnEnd(childId, cfg.subagent.decideMaxWaitMs)
+    await subagents.sendMessage(parent, childId, [{
+      type: 'text',
+      text: `【按用户风格拍板】${decision}\n按此继续做完，不要再回头问。`,
+    }], { signal })
+    log(`已把拍板发给子代理 ${childId}：${decision.slice(0, 300)}`)
+    return await wait
+  }
+
+  function waitChildTurnEnd(childId, timeoutMs) {
+    return new Promise((resolve) => {
+      const entry = { done: false, timer: undefined, finish: undefined }
+      const finish = (value) => {
+        if (entry.done === true) return
+        entry.done = true
+        clearTimeout(entry.timer)
+        const set = childWaiters.get(childId)
+        if (set !== undefined) {
+          set.delete(entry)
+          if (set.size === 0) childWaiters.delete(childId)
+        }
+        resolve(value)
+      }
+      entry.finish = finish
+      entry.timer = setTimeout(() => finish(''), timeoutMs)
+      entry.timer.unref?.()
+      const set = childWaiters.get(childId) ?? new Set()
+      set.add(entry)
+      childWaiters.set(childId, set)
+    })
+  }
+
+  function lastAssistantText(session) {
+    try {
+      const events = Array.isArray(session.events) ? session.events : []
+      for (let index = events.length - 1; index >= 0 && index >= events.length - 60; index -= 1) {
+        if (events[index]?.type !== 'assistant/message') continue
+        const blocks = events[index].data?.message?.content
+        if (!Array.isArray(blocks)) continue
+        const text = blocks
+          .filter((block) => block?.type === 'text' && typeof block.text === 'string')
+          .map((block) => block.text)
+          .join('\n')
+          .trim()
+        if (text !== '') return text
+      }
+    } catch {
+      // 读不到就算空
+    }
+    return ''
+  }
+
+  async function personaDecide(stage, summary, session) {
+    const system = [
+      readPersona(),
+      '',
+      '用户此刻不在场。你要替他把这个卡住的地方定下来：',
+      '直接给可执行的决定，1-3 句；不要解释你的人格、不要 JSON、不要复述问题。',
+    ].join('\n')
+    const userText = `收尾步骤：${stage.id}\n子代理说自己卡住了，它的汇报：\n${summary.slice(0, 4000)}\n\n请给出一句可以执行的决定。`
+    return (await streamPersonaLlm(system, userText, session)).trim()
+  }
+
+  /* ---------------- 执行器 B：新会话（可见，可代答） ---------------- */
+
+  async function createStageSession(chain) {
+    const controller = ctx.get('sessionController')
+    if (controller === undefined) throw new Error('缺少 sessionController 服务')
+    const root = sessionsService()?.get(chain.rootId)
+    const stage = cfg.stages[chain.stageIndex]
+    if (stage === undefined) throw new Error(`阶段 ${chain.stageIndex} 不存在`)
+    const agentPreset = root === undefined ? undefined : selectedPreset(root)
+
+    const request = chain.workspaceId !== undefined && chain.workspaceId !== ''
+      ? { workspaceId: chain.workspaceId, ...(agentPreset === undefined ? {} : { agentPreset }) }
+      : { cwd: chain.cwd, ...(agentPreset === undefined ? {} : { agentPreset }) }
+    const created = await controller.create(request)
+    chain.currentSessionId = created.sessionId
+    chain.sessions.push(created.sessionId)
+    chain.updatedAt = Date.now()
+    stageSessions.set(created.sessionId, chain.rootId)
+    persist()
+
+    try {
+      const title = stageTitle(stage, chain.rootTitle || (root === undefined ? '' : sessionTitle(root)))
+      await controller.rename({ sessionId: created.sessionId, title })
+    } catch (error) {
+      log(`收尾会话命名失败：${describeError(error)}`)
+    }
+
+    if (cfg.dryRun) {
+      log(`[dry-run] 本该在 ${created.sessionId} 发第 ${chain.stageIndex + 1} 步提示`)
+      return
+    }
+
+    const text = buildStagePrompt(stage)
+    const abort = new AbortController()
+    try {
+      await controller.prompt({
+        requestId: randomUUID(),
+        sessionId: created.sessionId,
+        mode: 'queue',
+        content: [{ type: 'text', text }],
+      }, abort.signal)
+    } catch (error) {
+      chain.status = 'failed'
+      chain.updatedAt = Date.now()
+      persist()
+      log(`第 ${chain.stageIndex + 1} 步提示发送失败（${created.sessionId}）：${describeError(error)}`)
+      return
+    }
+    log(`收尾第 ${chain.stageIndex + 1} 步已在新会话 ${created.sessionId} 开始（${stage.id}）`)
+  }
+
+  async function advance(rootId, stageSession) {
+    const chain = chains.get(rootId)
+    if (chain === undefined || chain.status !== 'running') return
+    if (chain.currentSessionId !== stageSession.id) return
+    if (Date.now() - chain.startedAt > cfg.maxChainAgeMs) {
+      chain.status = 'failed'
+      chain.updatedAt = Date.now()
+      persist()
+      log(`收尾链 ${rootId} 超时放弃`)
+      return
+    }
+    if (!inboxIdle(stageSession)) {
+      log(`收尾会话 ${stageSession.id} 还有排队输入，暂不推进`)
+      return
+    }
+    if (chain.stageIndex >= cfg.stages.length - 1) {
+      chain.status = 'done'
+      chain.updatedAt = Date.now()
+      persist()
+      log(`收尾链 ${rootId} 全部完成（${chain.sessions.length} 个新会话）`)
+      return
+    }
+    chain.stageIndex += 1
+    chain.updatedAt = Date.now()
+    persist()
+    log(`收尾链 ${rootId} 推进到第 ${chain.stageIndex + 1} 步`)
+    try {
+      await createStageSession(chain)
+    } catch (error) {
+      chain.status = 'failed'
+      chain.updatedAt = Date.now()
+      persist()
+      log(`收尾链 ${rootId} 第 ${chain.stageIndex + 1} 步开场失败：${describeError(error)}`)
+    }
+  }
+
+  /* ---------------- 人格（文件 + 内置兜底） ---------------- */
+
+  function readPersona() {
+    if (personaCache !== undefined) return personaCache
+    try {
+      const text = fs.readFileSync(cfg.persona.file, 'utf8').trim()
+      if (text !== '') {
+        personaCache = text
+        return personaCache
+      }
+    } catch (error) {
+      if (!(error && typeof error === 'object' && error.code === 'ENOENT')) {
+        log(`读人格文件失败（用内置人格）：${describeError(error)}`)
+      }
+    }
+    personaCache = DEFAULT_PERSONA
+    return personaCache
+  }
+
+  /** 会话最近若干条消息的文本摘要，按字节预算截断。 */
+  function sessionDigest(session, maxBytes) {
+    const lines = []
+    try {
+      const events = Array.isArray(session.events) ? session.events : []
+      for (let index = events.length - 1; index >= 0 && index >= events.length - 200; index -= 1) {
+        const event = events[index]
+        if (event?.type !== 'user/message' && event?.type !== 'assistant/message') continue
+        const blocks = event.data?.message?.content
+        if (!Array.isArray(blocks)) continue
+        const text = blocks
+          .filter((block) => block?.type === 'text' && typeof block.text === 'string')
+          .map((block) => block.text)
+          .join('\n')
+          .trim()
+        if (text === '') continue
+        lines.unshift(`${event.type === 'user/message' ? '用户' : '助手'}：${text.slice(0, 3000)}`)
+        if (Buffer.byteLength(lines.join('\n\n'), 'utf8') > maxBytes) break
+      }
+    } catch {
+      // 摘要失败不影响代答（模型还能靠问题本身选）
+    }
+    const joined = lines.join('\n\n')
+    if (Buffer.byteLength(joined, 'utf8') <= maxBytes) return joined
+    return joined.slice(-Math.floor(maxBytes / 2))
+  }
+
+  function buildUserMessage(text) {
+    return {
+      id: randomUUID(),
+      role: 'user',
+      content: [{ type: 'text', text }],
+      source: { kind: SOURCE_KIND },
+    }
+  }
+
+  async function resolveReasoningEffort(llm) {
+    try {
+      await llm.resolveCallConfig({ provider: cfg.persona.provider, model: cfg.persona.model, reasoningEffort: 'off' })
+      return 'off'
+    } catch {
+      return undefined
+    }
+  }
+
+  async function callPersonaModel(questions, context, session) {
+    const system = `${readPersona()}\n${PERSONA_RULES}`
+    const payload = JSON.stringify({ questions, context: context === '' ? '（无摘要）' : context }, null, 2)
+    return streamPersonaLlm(system, payload, session)
+  }
+
+  async function streamPersonaLlm(system, userText, session) {
+    const llm = ctx.get('llm')
+    if (llm === undefined) throw new Error('缺少 llm 服务')
+    const effort = await resolveReasoningEffort(llm)
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(new Error('persona timeout')), cfg.persona.timeoutMs)
+    try {
+      const options = {
+        provider: cfg.persona.provider,
+        model: cfg.persona.model,
+        messages: [buildUserMessage(userText)],
+        system,
+        maxTokens: cfg.persona.maxOutputTokens,
+        sessionId: session?.id ?? 'finish-line',
+        purpose: 'finish-line-persona',
+        signal: controller.signal,
+      }
+      if (effort !== undefined) options.reasoningEffort = effort
+      let text = ''
+      let finish
+      for await (const chunk of llm.stream(options)) {
+        if (!chunk || typeof chunk !== 'object') continue
+        if (chunk.type === 'text-delta') text += chunk.text
+        else if (chunk.type === 'finish') finish = chunk.reason
+      }
+      if (finish && finish.kind && finish.kind !== 'stop') {
+        throw new Error(`人格模型 finish=${finish.kind}${finish.failure?.message ? `: ${finish.failure.message}` : ''}`)
+      }
+      return text
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  async function personaAnswer(request, agent) {
+    const questions = questionsForModel(request.questions)
+    const context = sessionDigest(agent.session, cfg.persona.maxContextBytes)
+    let lastError
+    for (let attempt = 0; attempt <= cfg.persona.retries; attempt += 1) {
+      try {
+        const text = await callPersonaModel(questions, context, agent.session)
+        return validateAnswers(parseAnswerJson(text), request.questions)
+      } catch (error) {
+        lastError = error
+        log(`人格代答第 ${attempt + 1} 次失败：${describeError(error)}`)
+      }
+    }
+    throw lastError ?? new Error('人格代答失败')
+  }
+
+  /* ---------------- 事件接线 ---------------- */
+
+  ctx.on('session/event', (session, event) => {
+    if (cfg.enabled !== true) return
+    try {
+      if (event.type === 'tool/call') {
+        toolCalled.set(session.id, true)
+        return
+      }
+      if (event.type !== 'turn/end') return
+      const waiters = childWaiters.get(session.id)
+      if (waiters !== undefined && waiters.size > 0) {
+        setTimeout(() => {
+          const text = lastAssistantText(session)
+          for (const entry of waiters) entry.finish?.(text)
+        }, 0)
+      }
+      scheduleCheck(session)
+    } catch (error) {
+      log(`处理会话事件失败：${describeError(error)}`)
+    }
+  })
+
+  // 人格代答：只在「新会话」执行器的收尾会话里抢答；子代理模式走提示词，
+  // 其它会话一律 next()，绝不干扰任务会话。
+  ctx.on('user-questions/request', async (request, next) => {
+    try {
+      if (cfg.executor !== 'session') return next()
+      if (cfg.persona.enabled !== true) return next()
+      const agent = request.agent
+      if (agent === undefined) return next()
+      const sessionId = agent.session?.id
+      if (typeof sessionId !== 'string' || !isStageSession(sessionId)) return next()
+      if (request.questions.some((question) => question.intent !== undefined)) {
+        log(`收尾会话 ${sessionId} 的提问带 plan-review 意图，交回真人`)
+        return next()
+      }
+      const startedAt = Date.now()
+      const answer = await personaAnswer(request, agent)
+      log(`收尾会话 ${sessionId} 已由人格代答（${request.questions.length} 问，${Date.now() - startedAt}ms）`)
+      return answer
+    } catch (error) {
+      log(`人格代答失败，交回真人：${describeError(error)}`)
+      return next()
+    }
+  })
+
+  ctx.on('agent/created', ({ agent }) => {
+    if (agent === undefined || typeof agent.session?.id !== 'string') return
+    if (!isStageSession(agent.session.id)) return
+    log(`收尾会话 ${agent.session.id} 的 agent 已就绪，代答生效`)
+  })
+
+  ctx.effect(() => {
+    loadState()
+    log(`已启用（executor=${cfg.executor}，quiet=${cfg.quietMs}ms，persona=${cfg.persona.enabled ? 'on' : 'off'}，dryRun=${cfg.dryRun}）`)
+    return () => {
+      for (const timer of timers.values()) clearTimeout(timer)
+      timers.clear()
+      for (const abort of aborts.values()) abort.abort()
+      aborts.clear()
+    }
+  })
+
+  return {}
+}
