@@ -52,6 +52,13 @@ test('人格文件默认随插件仓库分发，不指向用户家目录的散�
   assert.ok(cfg.persona.file.includes('dsh-finish-line'), `实际值：${cfg.persona.file}`)
 })
 
+test('决策台账默认落在 ~/.dsh，可被配置覆盖，记录人类可读', () => {
+  const cfg = resolveConfig({})
+  assert.match(cfg.decisionsFile, /finish-line\.decisions\.jsonl$/)
+  const custom = resolveConfig({ decisionsFile: '/tmp/x.jsonl' })
+  assert.equal(custom.decisionsFile, '/tmp/x.jsonl')
+})
+
 test('stageTitle 在 80 字节内', () => {
   const title = stageTitle(stages[0], '一个很长很长很长很长很长很长很长很长很长很长很长很长的会话标题')
   assert.ok(Buffer.byteLength(title, 'utf8') <= 80)

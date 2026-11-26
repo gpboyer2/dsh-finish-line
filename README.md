@@ -81,6 +81,7 @@ dsh plugin --profile <你的profile> add link:$HOME/.dsh/plugins/dsh-finish-line
 | 两种执行器 | `subagent`（默认，侧栏不列）或 `session`（两个新会话，侧栏可见）。 |
 | 人格必然介入 | 子代理汇报「定不了 / 需要拍板」→ 蒸馏人格必然拍板，决定发回同一子代理；session 模式的收尾提问必然由人格代答。**没有开关，是必然业务。** |
 | 断点恢复 | 链状态落盘，保留 7 天、最多 300 条。 |
+| 决策台账 | 人格每次代答/拍板，把问题、全部选项、答案完整落盘成 JSONL，供事后复盘。 |
 | dry-run | 只写判定与日志，不启子代理、不改代码。 |
 | 零依赖 | 只用 DSH 注入的宿主服务与 Node 内置模块。 |
 
@@ -117,6 +118,7 @@ dsh plugin --profile <你的profile> add link:$HOME/.dsh/plugins/dsh-finish-line
 | `persona.maxContextBytes` / `maxOutputTokens` | `24576` / `700` | session 模式代答的会话摘要上限 / 单次输出上限。 |
 | `persona.timeoutMs` / `retries` | `90000` / `1` | 人格调用的超时与重试。 |
 | `logFile` | `~/.dsh/logs/finish-line.log` | 日志位置。 |
+| `decisionsFile` | `~/.dsh/finish-line.decisions.jsonl` | 决策台账：人格代答/拍板的完整记录，一行一次决策。 |
 
 **人格的四条铁律（2026-11-25 用户定死，不可配置）：**
 
@@ -141,7 +143,8 @@ dsh plugin --profile <你的profile> add link:$HOME/.dsh/plugins/dsh-finish-line
 
 ## 日志与诊断
 
-- `~/.dsh/logs/finish-line.log`：每步启动、`stopReason`、结果摘要、人格何时出场、拍板内容。触发判定也逐条记：非 Git 目录、工作区干净、还有排队输入，各写一行原因。
+- `~/.dsh/logs/finish-line.log`：每步启动、`stopReason`、结果摘要、人格何时出场、拍板内容。触发判定也逐条记：非 Git 目录、工作区干净、还有排队输入、活没干完，各写一行原因。人格代答后还会写一行可读明细（问题 → 选了什么）。
+- `~/.dsh/finish-line.decisions.jsonl`：决策台账，一行一条。`kind=answer` 记录 session 模式代答（问题、全部选项、人格答案）；`kind=decide` 记录 subagent 模式拍板（子代理卡点原文、人格决定）。复盘时直接看这个文件，或 `jq` 过滤。
 - `~/.dsh/finish-line.state.json`：按根会话记链，保留 7 天；设置了 `DSH_PROFILE_DIR` 时落在 profile 目录。
 
 一次没触发，按日志最后一行定位：
@@ -163,7 +166,7 @@ cordis.patch.yml          bundle patch：插入插件行并给默认配置
 locale/zh.json            插件市场里的中文名与一句话描述
 locale/en.json            英文名与描述
 icon.svg                  插件图标
-test/logic.test.mjs       纯逻辑测试（13 条）
+test/logic.test.mjs       纯逻辑测试（14 条）
 ```
 
 只用 `ctx` 注入的宿主服务（`sessions` / `agents` / `sessionController` / `llm` / `subagents` / `agentDefaultModel`）与 Node 内置模块；没有构建步骤；状态与日志都落在 `~/.dsh` 下。
@@ -171,7 +174,7 @@ test/logic.test.mjs       纯逻辑测试（13 条）
 ## 测试
 
 ```sh
-npm test        # node --test，13 条
+npm test        # node --test，14 条
 ```
 
 覆盖配置默认值与非法值钳制、人格无开关（enabled/provider/model/decideOnStuck 均不存在）、人格产物路径在仓库内、人格介入靠信号检测、「定不了」信号识别、提问答案校验（单选 / 多选 / 自定义 / 无选项）、模型输出解析容错。

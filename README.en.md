@@ -81,6 +81,7 @@ On a first install, run with `dryRun: true`: logs only, no code changes. Turn it
 | Two executors | `subagent` (default, not listed in the sidebar) or `session` (two new sessions, visible in the sidebar). |
 | Persona is mandatory | When a subagent reports "can't decide / needs a decision", the distilled persona **always** decides and the decision is sent back to the same subagent; in `session` mode the persona **always** answers stage-session questions. **No switch — this is business logic, not an option.** |
 | Resume | Chain state on disk, kept 7 days, at most 300 entries. |
+| Decision ledger | Every persona answer / decision is written to a JSONL ledger with the full question, all options, and the answer, for post-hoc review. |
 | dry-run | Writes the decision and logs only; starts no subagent, changes no code. |
 | Zero dependencies | Only host services injected by DSH and Node built-in modules. |
 
@@ -117,6 +118,7 @@ Override the plugin line's `config:` in `~/.dsh/profiles/desktop/cordis.patch.ym
 | `persona.maxContextBytes` / `maxOutputTokens` | `24576` / `700` | Session digest cap / per-call output cap for `session`-mode answering. |
 | `persona.timeoutMs` / `retries` | `90000` / `1` | Timeout and retries for persona calls. |
 | `logFile` | `~/.dsh/logs/finish-line.log` | Log location. |
+| `decisionsFile` | `~/.dsh/finish-line.decisions.jsonl` | Decision ledger: one JSONL row per persona answer / decision. |
 
 **Four non-negotiable rules for the persona (fixed by the user, 2026-11-25):**
 
@@ -141,7 +143,8 @@ Use `subagent` to save tokens; use `session` to watch and take over at any time.
 
 ## Logs and diagnostics
 
-- `~/.dsh/logs/finish-line.log`: each step's start, `stopReason`, result summary, when the persona appeared, and the decision text. Trigger checks are also logged line by line: non-Git directory, clean working tree, and pending queued input each get one line with the reason.
+- `~/.dsh/logs/finish-line.log`: each step's start, `stopReason`, result summary, when the persona appeared, and the decision text. Trigger checks are also logged line by line: non-Git directory, clean working tree, pending queued input, and unfinished work each get one line with the reason. After an answer, a readable detail line (question → choice) is logged.
+- `~/.dsh/finish-line.decisions.jsonl`: the decision ledger, one row per entry. `kind=answer` records `session`-mode answering (question, all options, persona answer); `kind=decide` records `subagent`-mode decisions (the subagent's stuck report, the persona's decision). Review it directly or filter with `jq`.
 - `~/.dsh/finish-line.state.json`: chains tracked per root session, kept 7 days; placed in the profile directory when `DSH_PROFILE_DIR` is set.
 
 If it did not trigger, locate the cause from the last log line:
@@ -163,7 +166,7 @@ cordis.patch.yml        bundle patch: inserts the plugin line and supplies defau
 locale/zh.json          Chinese name and one-line description for the plugin market
 locale/en.json          English name and description
 icon.svg                Plugin icon
-test/logic.test.mjs     Pure-logic tests (13)
+test/logic.test.mjs     Pure-logic tests (14)
 ```
 
 Uses only host services injected via `ctx` (`sessions` / `agents` / `sessionController` / `llm` / `subagents` / `agentDefaultModel`) and Node built-in modules; no build step; state and logs both live under `~/.dsh`.
@@ -171,7 +174,7 @@ Uses only host services injected via `ctx` (`sessions` / `agents` / `sessionCont
 ## Tests
 
 ```sh
-npm test        # node --test, 13 tests
+npm test        # node --test, 14 tests
 ```
 
 Coverage: config defaults and clamping, persona has no switches (`enabled` / `provider` / `model` / `decideOnStuck` are all absent), persona artifact path is inside the repo, persona intervention via signal detection, detection of "can't decide" signals, validation of question answers (single choice / multiple choice / custom / no options), tolerant parsing of model output.

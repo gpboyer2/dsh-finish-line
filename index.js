@@ -121,6 +121,11 @@ export const DEFAULTS = {
     retries: 1,
   },
   logFile: path.join(os.homedir(), '.dsh', 'logs', 'finish-line.log'),
+  /**
+   * 决策台账：人格代答/拍板的完整记录（问题、全部选项、答案），JSONL 一行
+   * 一条，供事后复盘。不写进仓库，属于本机运行时数据。
+   */
+  decisionsFile: path.join(os.homedir(), '.dsh', 'finish-line.decisions.jsonl'),
 }
 
 /** 代答的系统提示（人格文件之后追加）。 */
@@ -187,6 +192,7 @@ export function resolveConfig(config = {}) {
       retries: Math.round(clampNumber(persona.retries, 0, 3, DEFAULTS.persona.retries)),
     },
     logFile: nonEmptyString(merged.logFile, DEFAULTS.logFile),
+    decisionsFile: nonEmptyString(merged.decisionsFile, DEFAULTS.decisionsFile),
   }
 }
 
@@ -337,6 +343,21 @@ export function apply(ctx, config = {}) {
       // 日志失败不影响主流程
     }
     if (cfg.dryRun) console.log(`[finish-line] ${message}`)
+  }
+
+  /**
+   * 决策台账：把人格代答/拍板的完整上下文落盘，供事后复盘。
+   * 一条 JSONL = 一次决策；写失败只记日志，绝不影响收尾主流程。
+   * @param {object} entry 决策记录（kind / questions / answers / decision …）
+   */
+  function recordDecision(entry) {
+    const row = { at: new Date().toISOString(), ...entry }
+    try {
+      fs.mkdirSync(path.dirname(cfg.decisionsFile), { recursive: true })
+      fs.appendFileSync(cfg.decisionsFile, `${JSON.stringify(row)}\n`, 'utf8')
+    } catch (error) {
+      log(`写决策台账失败（不影响收尾）：${describeError(error)}`)
+    }
   }
 
   function normalizeChain(raw) {
@@ -686,6 +707,16 @@ export function apply(ctx, config = {}) {
     const session = sessionsService()?.get(childId) ?? sessionsService()?.get(chain.rootId)
     const decision = await personaDecide(stage, summary, session)
     if (decision === '') throw new Error('人格没有给出决定')
+    // 台账：子代理卡在哪里、人格拍了什么板，供事后复盘。
+    recordDecision({
+      kind: 'decide',
+      rootSessionId: chain.rootId,
+      stageSessionId: childId,
+      stageId: stage.id,
+      stageTitle: stage.titlePrefix,
+      stuckReport: summary,
+      decision,
+    })
     const wait = waitChildTurnEnd(childId, cfg.subagent.decideMaxWaitMs)
     await subagents.sendMessage(parent, childId, [{
       type: 'text',
@@ -1022,6 +1053,40 @@ export function apply(ctx, config = {}) {
       const startedAt = Date.now()
       const answer = await personaAnswer(request, agent)
       log(`收尾会话 ${sessionId} 已由人格代答（${request.questions.length} 问，${Date.now() - startedAt}ms）`)
+      // 台账：问题、全部选项、人格答案，供用户事后复盘。
+      const rootId = stageSessions.get(sessionId)
+      const chain = rootId === undefined ? undefined : chains.get(rootId)
+      const stage = chain === undefined ? undefined : cfg.stages[chain.stageIndex]
+      recordDecision({
+        kind: 'answer',
+        rootSessionId: rootId,
+        stageSessionId: sessionId,
+        stageId: stage?.id,
+        stageTitle: stage?.titlePrefix,
+        questions: request.questions.map((question) => ({
+          id: question.id,
+          header: question.header,
+          question: question.question,
+          detail: question.detail,
+          multiSelect: question.multiSelect === true,
+          options: (question.options ?? []).map((option) => ({
+            label: option.label,
+            description: option.description,
+          })),
+        })),
+        answers: answer.answers,
+      })
+      // 日志里再写一行可读摘要，方便直接 tail。
+      const readable = answer.answers
+        .map((item) => {
+          const question = request.questions.find((entry) => entry.id === item.id)
+          const chosen = item.custom !== undefined && item.selected.length === 0
+            ? item.custom
+            : item.selected.join(' / ')
+          return `${question?.header ?? item.id} → ${chosen}`
+        })
+        .join('；')
+      log(`人格代答明细：${readable}`)
       return answer
     } catch (error) {
       log(`人格代答失败，交回真人：${describeError(error)}`)
