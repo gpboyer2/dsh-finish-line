@@ -29,7 +29,8 @@
  *
  * 规则（用户 2026-11-25 明确要求）：
  *   - 触发：会话所在目录是 Git 仓库且有改动 → 必然触发；纯问答不触发。
- *   - 「等所有的话都说完了」：turn/end 之后静默 quietMs 且 inbox 为空才动手。
+ *   - 「等所有的话都说完了」：不靠静默计时，靠「排队」判定——所有顶层会话都
+ *     不在跑 turn、也没有排队输入时，才算全部干完，才启动收尾。
  *   - 任务会话本身绝不干预：那里 AI 提问就挂着等人（阻塞式提问时 turn 不会
  *     结束，链也不会启动）。
  *   - plan-review（计划审批）不代答，宁可挂住；代答失败一律 next() 交回真人。
@@ -68,8 +69,6 @@ export const DEFAULTS = {
   executor: 'subagent',
   /** 只写日志、不真跑（首次安装先观察用）。 */
   dryRun: false,
-  /** turn/end 之后等多久算「所有的话都说完了」。 */
-  quietMs: 20000,
   /** 本次会话至少发生过一次工具调用才算「干过活」，纯问答不触发。 */
   requireToolCall: true,
   maxChainAgeMs: 6 * 60 * 60 * 1000,
@@ -165,7 +164,6 @@ export function resolveConfig(config = {}) {
     enabled: merged.enabled !== false,
     executor: merged.executor === 'session' ? 'session' : 'subagent',
     dryRun: merged.dryRun === true,
-    quietMs: Math.round(clampNumber(merged.quietMs, 3000, 600000, DEFAULTS.quietMs)),
     requireToolCall: merged.requireToolCall !== false,
     maxChainAgeMs: Math.round(clampNumber(merged.maxChainAgeMs, 60000, 7 * 24 * 3600 * 1000, DEFAULTS.maxChainAgeMs)),
     gitTimeoutMs: Math.round(clampNumber(merged.gitTimeoutMs, 1000, 60000, DEFAULTS.gitTimeoutMs)),
@@ -504,9 +502,30 @@ export function apply(ctx, config = {}) {
   function inboxIdle(session) {
     const agent = liveAgent(session.id)
     if (agent === undefined) return true
+    if (agent.status === 'running') return false
     const nextTurn = Array.isArray(agent.inbox?.nextTurn) ? agent.inbox.nextTurn.length : 0
     const nextStep = Array.isArray(agent.inbox?.nextStep) ? agent.inbox.nextStep.length : 0
     return nextTurn === 0 && nextStep === 0
+  }
+
+  /** 一个 agent 是否彻底空闲：不在跑 turn（含等审批/等回答），也没有排队输入。 */
+  function agentIdle(agent) {
+    if (agent === undefined) return true
+    if (agent.status === 'running') return false
+    const nextTurn = Array.isArray(agent.inbox?.nextTurn) ? agent.inbox.nextTurn.length : 0
+    const nextStep = Array.isArray(agent.inbox?.nextStep) ? agent.inbox.nextStep.length : 0
+    return nextTurn === 0 && nextStep === 0
+  }
+
+  /** 所有顶层会话（root agents）是否都空闲——「排队的活全干完了」。 */
+  function rootAgents() {
+    const agents = ctx.get('agents')
+    if (agents === undefined || typeof agents.roots !== 'function') return []
+    return agents.roots()
+  }
+
+  function allRootsIdle() {
+    return rootAgents().every(agentIdle)
   }
 
   function hasToolCall(session) {
@@ -563,10 +582,12 @@ export function apply(ctx, config = {}) {
   function scheduleCheck(session) {
     const previous = timers.get(session.id)
     if (previous !== undefined) clearTimeout(previous)
+    // 不再用「静默 N 秒」判定：turn/end 后下一拍就评估，靠「所有会话是否空闲」
+    // 这个真实状态来决定。延迟 0 只是让 agent.status 从 running 落到 idle。
     const timer = setTimeout(() => {
       timers.delete(session.id)
       void evaluate(session).catch((error) => log(`评估会话 ${session.id} 失败：${describeError(error)}`))
-    }, cfg.quietMs)
+    }, 0)
     timer.unref?.()
     timers.set(session.id, timer)
   }
@@ -575,12 +596,35 @@ export function apply(ctx, config = {}) {
     const session = sessionsService()?.get(stale.id) ?? stale
     if (session.header.origin === 'subagent') return
 
+    // 收尾链自己的阶段会话结束后推进下一步；推进不受「全空闲」门禁影响。
     const chainRootId = stageSessions.get(session.id)
     if (chainRootId !== undefined) {
       await advance(chainRootId, session)
       return
     }
 
+    // 门禁：只要还有任何顶层会话在跑 turn 或排队输入，就整体不启动收尾。
+    // 每次 turn/end 都会再触发一次评估，等真正全部空闲的那一次再动手。
+    if (!allRootsIdle()) {
+      const busy = rootAgents().filter((agent) => !agentIdle(agent)).length
+      log(`还有 ${busy} 个顶层会话在跑或排队，等全部空闲、没有排队的活了再触发收尾`)
+      return
+    }
+
+    // 所有顶层会话都空闲了：把所有「本轮干完且未收尾」的根会话都评估一遍，
+    // 不只当前这一个——避免某个会话先干完、被后来居上的会话挡住而漏收尾。
+    const roots = rootAgents()
+    for (const agent of roots.length > 0 ? roots : [liveAgent(session.id)].filter(Boolean)) {
+      const id = agent?.session?.id
+      if (typeof id !== 'string' || id === '') continue
+      if (stageSessions.has(id)) continue
+      const rootSession = sessionsService()?.get(id)
+      if (rootSession === undefined || rootSession.header.origin === 'subagent') continue
+      await evaluateOne(rootSession)
+    }
+  }
+
+  async function evaluateOne(session) {
     // 已结束（done / failed）的旧链不挡新一轮：该会话本轮活干完了照样要触发。
     if (chains.has(session.id)) {
       const existing = chains.get(session.id)
@@ -599,10 +643,11 @@ export function apply(ctx, config = {}) {
     if (cfg.requireToolCall && !hasToolCall(session)) return
 
     // 活必须真干完：只有最近一次 turn/end 是 completed 才触发。被额度卡断
-    // （error）、用户主动中断（aborted）一律不启动收尾。
+    // （error）、用户主动中断（aborted）一律不启动收尾。没记录的会话静默跳过。
     const reasonKind = turnEnds.get(session.id)
+    if (reasonKind === undefined) return
     if (reasonKind !== 'completed') {
-      log(`会话 ${session.id} 最近一次回合结束原因=${reasonKind ?? '未知'}（非 completed），活没干完，不触发收尾`)
+      log(`会话 ${session.id} 最近一次回合结束原因=${reasonKind}（非 completed），活没干完，不触发收尾`)
       return
     }
 
@@ -1142,7 +1187,7 @@ export function apply(ctx, config = {}) {
 
   ctx.effect(() => {
     loadState()
-    log(`已启用（executor=${cfg.executor}，quiet=${cfg.quietMs}ms，persona=${cfg.persona.file}，dryRun=${cfg.dryRun}）`)
+    log(`已启用（executor=${cfg.executor}，排队空闲才收尾，persona=${cfg.persona.file}，dryRun=${cfg.dryRun}）`)
     return () => {
       for (const timer of timers.values()) clearTimeout(timer)
       timers.clear()

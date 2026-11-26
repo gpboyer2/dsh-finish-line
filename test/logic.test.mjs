@@ -24,16 +24,17 @@ test('resolveConfig 默认值：subagent 执行器、不传 agentOptions（继�
   const cfg = resolveConfig({})
   assert.equal(cfg.executor, 'subagent')
   assert.equal(cfg.subagent.agentOptions, null)
-  assert.equal(cfg.quietMs, 20000)
   assert.equal(cfg.requireToolCall, true)
   assert.equal(cfg.stages.length, 2)
 })
 
-test('resolveConfig 拒绝非法值并钳制安静窗口', () => {
-  const cfg = resolveConfig({ quietMs: 1, executor: 'whatever', stages: [] })
-  assert.equal(cfg.quietMs, 3000)
-  assert.equal(cfg.executor, 'subagent')
-  assert.equal(cfg.stages.length, 2)
+test('已放弃静默计时：配置里不再有 quietMs，传了也不生效', () => {
+  const cfg = resolveConfig({ quietMs: 1 })
+  assert.ok(!('quietMs' in cfg), 'quietMs 必须已移除')
+  const cfg2 = resolveConfig({ quietMs: 999999, executor: 'whatever', stages: [] })
+  assert.ok(!('quietMs' in cfg2))
+  assert.equal(cfg2.executor, 'subagent')
+  assert.equal(cfg2.stages.length, 2)
 })
 
 test('人格不是开关：enabled/provider/model/decideOnStuck 谁传都进不来', () => {

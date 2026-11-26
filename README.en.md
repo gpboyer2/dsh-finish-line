@@ -15,20 +15,19 @@ A DeepSeek Harness (DSH) plugin. A model often stops halfway after writing a fea
 
 ## Trigger conditions
 
-All five conditions must hold at once:
+All conditions must hold at once:
 
+- **All top-level sessions are idle**: no session is running a `turn` (`agent.status === 'running'`, including waiting on an approval or answer), and no session has queued input. If any session is still working or queued, nothing starts — **it keys off the queue, not how long it has been silent**.
 - **The work must actually be done**: the most recent `turn/end` reason must be `completed`. Quota-cut short (`error`), user interruption (`aborted`), or anything else never triggers — unfinished work does not enter the wrap-up.
 - The session directory is a Git repository with changes.
 - This session made at least one tool call. Pure Q&A does not trigger.
-- Silence for `quietMs` after `turn/end` (default 20 seconds).
-- The session's queued input is empty.
 
-A previous chain on the same session that has already ended (`done` / `failed`) does not block a new round: it is cleared and the session is re-evaluated. Only a chain currently running is not re-triggered.
+A previous chain on the same session that has already ended (`done` / `failed`) does not block a new round: it is cleared and the session is re-evaluated. Only a chain currently running is not re-triggered. When all sessions go idle, every root session that finished this round and has not been wrapped up is evaluated — so a session that finished earlier is not missed just because a later one outlasted it.
 
 ## How it works
 
 ```
-turn/end(reason=completed) ──▶ quiet 20s ──▶ queue drained
+turn/end(reason=completed) ──▶ all top-level sessions idle (no running turn, no queue)
                                             │
                                             ▼
                               check: Git repo && changes && tool called && work done
@@ -96,7 +95,6 @@ Override the plugin line's `config:` in `~/.dsh/profiles/desktop/cordis.patch.ym
     enabled: true
     executor: subagent      # subagent | session
     dryRun: false
-    quietMs: 20000
     requireToolCall: true
 ```
 
@@ -105,7 +103,6 @@ Override the plugin line's `config:` in `~/.dsh/profiles/desktop/cordis.patch.ym
 | `enabled` | `true` | Master switch. |
 | `executor` | `subagent` | `subagent`: in-process spawn, empty conversation, not listed in the sidebar; `session`: two new top-level sessions, visible in the sidebar. |
 | `dryRun` | `false` | Logs only, no real run. |
-| `quietMs` | `20000` | Silence window after `turn/end`. |
 | `requireToolCall` | `true` | Triggers only if the session made at least one tool call. |
 | `maxChainAgeMs` | `21600000` | A chain lives at most 6 hours; after that it is not resumed. |
 | `gitTimeoutMs` | `8000` | Per-call timeout for `git status` / `git diff`. |
@@ -185,7 +182,7 @@ One of them is a **hard constraint**: `buildStagePrompt` output must equal the s
 ## Limits
 
 - Subagents are not listed in the sidebar. To take over, set `executor: session` or open the parent session's subagents directory.
-- "Can't decide" relies on the protocol + signal phrases. A false positive costs one extra persona call and does not redo the work; a failed decision never passes silently — the chain stops and logs the stuck report.
+- "Can't decide" is detected from signal phrases in the subagent's report (no extra prompt involved). A false positive costs one extra persona call and does not redo the work; a failed decision never passes silently — the chain stops and logs the stuck report.
 - Persona inference uses the host's GUI-selected default model (`agentDefaultModel.currentSelection()`); no machine binding. No default model configured → failed decision logged, chain stops.
 - A large untracked directory also counts as a change. `git status` reports it as "has changes"; commit or clean it first.
 - `session` mode does not answer plan approvals. Questions with `plan-review` intent are not answered; the chain would rather hang and wait for a human.

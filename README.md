@@ -15,20 +15,19 @@
 
 ## 触发条件
 
-以下五条同时满足才启动：
+以下条件同时满足才启动：
 
+- **所有顶层会话都空闲**：没有会话在跑 `turn`（`agent.status === 'running'`，含等审批/等回答），也没有任何排队输入。只要还有一个会话在干活或排队，就整体不启动——**不看静默多久，只看排队是否清空**。
 - **活必须真干完**：该会话最近一次 `turn/end` 的结束原因是 `completed`。被额度卡断（`error`）、用户主动中断（`aborted`）一律不触发——没干完就不进收尾。
 - 会话所在目录是 Git 仓库，且有改动。
 - 本会话至少发生过一次工具调用。纯问答不触发。
-- `turn/end` 之后静默 `quietMs`（默认 20 秒）。
-- 该会话的排队输入已清空。
 
-同一会话上一条已结束的旧链（`done` / `failed`）不挡新一轮：会被清掉，按本轮重新判定。只有正在运行的链不重复触发。
+同一会话上一条已结束的旧链（`done` / `failed`）不挡新一轮：会被清掉，按本轮重新判定。只有正在运行的链不重复触发。所有会话空闲时，会把本轮「干完且未收尾」的根会话都评估一遍，避免先干完的会话被后来居上的会话挡住而漏收尾。
 
 ## 工作方式
 
 ```
-turn/end(reason=completed) ──▶ 静默 20s ──▶ 排队输入清空
+turn/end(reason=completed) ──▶ 所有顶层会话都空闲（无 running turn、无排队）
                                             │
                                             ▼
                               判定：Git 仓库 && 有改动 && 调过工具 && 活干完
@@ -96,7 +95,6 @@ dsh plugin --profile <你的profile> add link:$HOME/.dsh/plugins/dsh-finish-line
     enabled: true
     executor: subagent      # subagent | session
     dryRun: false
-    quietMs: 20000
     requireToolCall: true
 ```
 
@@ -105,7 +103,6 @@ dsh plugin --profile <你的profile> add link:$HOME/.dsh/plugins/dsh-finish-line
 | `enabled` | `true` | 总开关。 |
 | `executor` | `subagent` | `subagent`：进程内 spawn，空对话，侧栏不列；`session`：两个全新顶层会话，侧栏可见。 |
 | `dryRun` | `false` | 只写日志、不真跑。 |
-| `quietMs` | `20000` | `turn/end` 之后的静默窗口。 |
 | `requireToolCall` | `true` | 本会话至少一次工具调用才触发。 |
 | `maxChainAgeMs` | `21600000` | 一条链最长存活 6 小时，超时不再恢复。 |
 | `gitTimeoutMs` | `8000` | `git status` / `git diff` 的单次超时。 |
@@ -185,7 +182,7 @@ npm test        # node --test，15 条
 ## 边界
 
 - 子代理侧栏不可见。要接管就改 `executor: session`，或去父会话的子代理目录。
-- 「定不了」靠协议 + 信号词；误判只会多一次人格调用，不会重复干活；漏判不会静默放过——拍板失败链会停下，卡点留在日志。
+- 「定不了」靠子代理汇报里的信号词自动检测（不靠任何额外提示词）；误判只会多一次人格调用，不会重复干活；漏判不会静默放过——拍板失败链会停下，卡点留在日志。
 - 人格拍板用的模型是宿主 GUI 里选的默认模型（`agentDefaultModel.currentSelection()`），不绑定任何机器。没配过默认模型 → 拍板失败并记日志，链停下。
 - 未跟踪的大目录也算改动。`git status` 会把它算作「有改动」，先提交或清理。
 - `session` 模式不代答计划审批。`plan-review` 意图的提问不会被替答，宁可挂住等真人。
