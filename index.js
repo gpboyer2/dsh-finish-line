@@ -517,15 +517,40 @@ export function apply(ctx, config = {}) {
     return nextTurn === 0 && nextStep === 0
   }
 
-  /** 所有顶层会话（root agents）是否都空闲——「排队的活全干完了」。 */
+  /** 所有顶层会话（root agents）。 */
   function rootAgents() {
     const agents = ctx.get('agents')
     if (agents === undefined || typeof agents.roots !== 'function') return []
     return agents.roots()
   }
 
-  function allRootsIdle() {
-    return rootAgents().every(agentIdle)
+  /**
+   * 当前会话「本项目」的会话 id 集合：同一 workspace 内的会话。
+   * 拿不到 workspace 时退回「同一个 cwd 的顶层会话」，绝不去等别的项目。
+   */
+  function projectSessionIds(session) {
+    const workspace = workspaceOf(session)
+    if (workspace !== undefined && Array.isArray(workspace.sessionIds) && workspace.sessionIds.length > 0) {
+      return workspace.sessionIds
+    }
+    const cwd = sessionCwd(session)
+    const ids = rootAgents()
+      .filter((agent) => agent?.session !== undefined && sessionCwd(agent.session) === cwd)
+      .map((agent) => agent.session.id)
+    if (!ids.includes(session.id)) ids.push(session.id)
+    return ids
+  }
+
+  /** 本项目内的顶层 agent 列表（只算本项目，别的项目不参与）。 */
+  function projectAgents(session) {
+    const ids = new Set(projectSessionIds(session))
+    const scoped = rootAgents().filter((agent) => ids.has(agent?.session?.id))
+    return scoped.length > 0 ? scoped : [liveAgent(session.id)].filter(Boolean)
+  }
+
+  /** 本项目（不是整个 DSH）内的会话是否都空闲。 */
+  function allProjectIdle(session) {
+    return projectAgents(session).every(agentIdle)
   }
 
   function hasToolCall(session) {
@@ -603,18 +628,18 @@ export function apply(ctx, config = {}) {
       return
     }
 
-    // 门禁：只要还有任何顶层会话在跑 turn 或排队输入，就整体不启动收尾。
-    // 每次 turn/end 都会再触发一次评估，等真正全部空闲的那一次再动手。
-    if (!allRootsIdle()) {
-      const busy = rootAgents().filter((agent) => !agentIdle(agent)).length
-      log(`还有 ${busy} 个顶层会话在跑或排队，等全部空闲、没有排队的活了再触发收尾`)
+    // 门禁：只要**本项目**内还有会话在跑 turn 或排队输入，就整体不启动收尾；
+    // 别的项目的会话与我无关，不等。每次 turn/end 都会再触发一次评估。
+    if (!allProjectIdle(session)) {
+      const busy = projectAgents(session).filter((agent) => !agentIdle(agent)).length
+      log(`本项目还有 ${busy} 个会话在跑或排队，等它们全部空闲再触发收尾`)
       return
     }
 
-    // 所有顶层会话都空闲了：把所有「本轮干完且未收尾」的根会话都评估一遍，
+    // 本项目都空闲了：把本项目里「本轮干完且未收尾」的会话都评估一遍，
     // 不只当前这一个——避免某个会话先干完、被后来居上的会话挡住而漏收尾。
-    const roots = rootAgents()
-    for (const agent of roots.length > 0 ? roots : [liveAgent(session.id)].filter(Boolean)) {
+    const scoped = projectAgents(session)
+    for (const agent of scoped) {
       const id = agent?.session?.id
       if (typeof id !== 'string' || id === '') continue
       if (stageSessions.has(id)) continue

@@ -17,17 +17,17 @@ A DeepSeek Harness (DSH) plugin. A model often stops halfway after writing a fea
 
 All conditions must hold at once:
 
-- **All top-level sessions are idle**: no session is running a `turn` (`agent.status === 'running'`, including waiting on an approval or answer), and no session has queued input. If any session is still working or queued, nothing starts — **it keys off the queue, not how long it has been silent**.
+- **All sessions in this project are idle**: within this project (same workspace), no session is running a `turn` (`agent.status === 'running'`, including waiting on an approval or answer) and none has queued input. If any session in this project is still working or queued, nothing starts — **it keys off the queue, not how long it has been silent**. Sessions in other projects do not matter and are not waited on.
 - **The work must actually be done**: the most recent `turn/end` reason must be `completed`. Quota-cut short (`error`), user interruption (`aborted`), or anything else never triggers — unfinished work does not enter the wrap-up.
 - The session directory is a Git repository with changes.
 - This session made at least one tool call. Pure Q&A does not trigger.
 
-A previous chain on the same session that has already ended (`done` / `failed`) does not block a new round: it is cleared and the session is re-evaluated. Only a chain currently running is not re-triggered. When all sessions go idle, every root session that finished this round and has not been wrapped up is evaluated — so a session that finished earlier is not missed just because a later one outlasted it.
+A previous chain on the same session that has already ended (`done` / `failed`) does not block a new round: it is cleared and the session is re-evaluated. Only a chain currently running is not re-triggered. When the project goes idle, every session in it that finished this round and has not been wrapped up is evaluated — so a session that finished earlier is not missed just because a later one outlasted it.
 
 ## How it works
 
 ```
-turn/end(reason=completed) ──▶ all top-level sessions idle (no running turn, no queue)
+turn/end(reason=completed) ──▶ all sessions in this project idle (no running turn, no queue)
                                             │
                                             ▼
                               check: Git repo && changes && tool called && work done
