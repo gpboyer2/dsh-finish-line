@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url'
 import {
   DEFAULTS,
   buildStagePrompt,
+  formatDecisionMessage,
   needsDecision,
   parseAnswerJson,
   resolveConfig,
@@ -57,6 +58,30 @@ test('决策台账默认落在 ~/.dsh，可被配置覆盖，记录人类可读'
   assert.match(cfg.decisionsFile, /finish-line\.decisions\.jsonl$/)
   const custom = resolveConfig({ decisionsFile: '/tmp/x.jsonl' })
   assert.equal(custom.decisionsFile, '/tmp/x.jsonl')
+})
+
+test('formatDecisionMessage 把问题、全部选项、人格选择都写进会话可见文本', () => {
+  const questions = [
+    {
+      id: 'q1',
+      header: '杠杆倍数',
+      question: '群委会主席用几倍？',
+      options: [
+        { label: '3 倍', description: '默认值' },
+        { label: '5 倍', description: '用户指定' },
+      ],
+    },
+    { id: 'q2', header: '保证金模式', question: '共享还是分开？', options: [] },
+  ]
+  const text = formatDecisionMessage(questions, [
+    { id: 'q1', selected: ['5 倍'] },
+    { id: 'q2', selected: [], custom: '共享' },
+  ])
+  assert.match(text, /杠杆倍数 — 群委会主席用几倍？/)
+  assert.match(text, /- 3 倍：默认值/)
+  assert.match(text, /- 5 倍：用户指定/)
+  assert.match(text, /人格选择：5 倍/)
+  assert.match(text, /人格选择：共享/)
 })
 
 test('stageTitle 在 80 字节内', () => {

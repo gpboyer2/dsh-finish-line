@@ -232,6 +232,37 @@ export function buildStagePrompt(stage) {
   return stage.prompt
 }
 
+/**
+ * 把一次人格代答格式化成会话里肉眼可读的消息：问题、全部选项、人格选择。
+ * 这条消息会以 user/message 追加进收尾会话，用户随时能看到、复盘。
+ * @param {Array} questions 宿主给的原始问题（含 options）
+ * @param {Array} answers 人格给出的答案（{id, selected, custom?}）
+ */
+export function formatDecisionMessage(questions, answers) {
+  const lines = ['【人格代答】收尾会话的提问已由蒸馏人格替你决定：']
+  for (const question of questions) {
+    const answer = answers.find((item) => item && item.id === question.id)
+    lines.push('')
+    const head = question.header !== undefined && question.header !== '' ? `${question.header} — ` : ''
+    lines.push(`问题：${head}${question.question ?? ''}`)
+    if (Array.isArray(question.options) && question.options.length > 0) {
+      lines.push('选项：')
+      for (const option of question.options) {
+        const desc = option.description !== undefined && option.description !== '' ? `：${option.description}` : ''
+        lines.push(`- ${option.label}${desc}`)
+      }
+    }
+    let chosen = '（无记录）'
+    if (answer !== undefined) {
+      chosen = answer.custom !== undefined && answer.selected.length === 0
+        ? answer.custom
+        : answer.selected.join(' / ')
+    }
+    lines.push(`人格选择：${chosen}`)
+  }
+  return lines.join('\n')
+}
+
 /** 把问题裁剪成给模型看的形状（不出卖宿主内部对象）。 */
 export function questionsForModel(questions) {
   return questions.map((question) => ({
@@ -1053,6 +1084,15 @@ export function apply(ctx, config = {}) {
       const startedAt = Date.now()
       const answer = await personaAnswer(request, agent)
       log(`收尾会话 ${sessionId} 已由人格代答（${request.questions.length} 问，${Date.now() - startedAt}ms）`)
+      // 让代答肉眼可见：把问题、全部选项、人格选择作为一条消息追加进收尾会话。
+      // 用 surfaceOp: 'append' 进可见消息流；source 不是 user，不会触发 agent 多跑一轮。
+      if (agent.session !== undefined) {
+        try {
+          agent.session.append('user/message', buildUserMessage(formatDecisionMessage(request.questions, answer.answers)), { surfaceOp: 'append' })
+        } catch (error) {
+          log(`写会话内代答记录失败（不影响代答）：${describeError(error)}`)
+        }
+      }
       // 台账：问题、全部选项、人格答案，供用户事后复盘。
       const rootId = stageSessions.get(sessionId)
       const chain = rootId === undefined ? undefined : chains.get(rootId)
