@@ -1,6 +1,6 @@
 # dsh-finish-line
 
-> 一句话：任务会话结束、排队输入清空后，自动串行执行两步收尾——先把公共函数收进公共模块，再分批审 diff、提交、推送。
+> 一句话：本工作区的所有会话都完成（结束）后，自动、串行执行两段收尾命令——先组件化整理，再批判式提交推送。
 
 [简体中文](README.md) · [English](README.en.md)
 
@@ -8,10 +8,13 @@
 ![Node.js](https://img.shields.io/badge/Node.js-22%2B-339933?style=flat-square&logo=node.js&logoColor=white)
 ![JavaScript](https://img.shields.io/badge/JavaScript-ESM-F7DF1E?style=flat-square&logo=javascript&logoColor=black)
 ![Cordis](https://img.shields.io/badge/Cordis-plugin-FF6B6B?style=flat-square)
-![tests](https://img.shields.io/badge/tests-9-brightgreen?style=flat-square)
+![tests](https://img.shields.io/badge/tests-15-brightgreen?style=flat-square)
 ![license](https://img.shields.io/badge/license-MIT-brightgreen?style=flat-square)
 
-一个 DeepSeek Harness（DSH）插件。模型写完功能常常停在半路：公共函数散在各处，改动没提交，diff 没人审。收尾不在一轮任务的目标范围内，本插件把它挪到回合结束之后单独执行。
+一个 DeepSeek Harness（DSH）插件。本工作区的所有会话都完成（结束）后，自动、串行地调用两段命令：
+
+1. `git diff` 将公共函数整理到 utils 相关模块中，要求在组件化、模块化的指导思路下举一反三，以此类推；
+2. 调用技能 `cc-git-commit` 同步并推送代码，分批，注意 diff 的过程中批判下、看看有没有隐患、bug、遗漏。
 
 ## 触发条件
 

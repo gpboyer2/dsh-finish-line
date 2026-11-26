@@ -1,6 +1,6 @@
 # dsh-finish-line
 
-> Runs two serial wrap-up steps after a task session ends and its queued input drains: componentization cleanup, then critical commit.
+> After all sessions in this workspace have finished, runs two wrap-up commands in series: componentization cleanup, then critical commit and push.
 
 [English](README.en.md) · [简体中文](README.md)
 
@@ -8,10 +8,13 @@
 ![Node.js](https://img.shields.io/badge/Node.js-22%2B-339933?style=flat-square&logo=node.js&logoColor=white)
 ![JavaScript](https://img.shields.io/badge/JavaScript-ESM-F7DF1E?style=flat-square&logo=javascript&logoColor=black)
 ![Cordis](https://img.shields.io/badge/Cordis-plugin-FF6B6B?style=flat-square)
-![tests](https://img.shields.io/badge/tests-9-brightgreen?style=flat-square)
+![tests](https://img.shields.io/badge/tests-15-brightgreen?style=flat-square)
 ![license](https://img.shields.io/badge/license-MIT-brightgreen?style=flat-square)
 
-A DeepSeek Harness (DSH) plugin. A model often stops halfway after writing a feature: shared functions scattered around, changes uncommitted, the diff unreviewed. Wrap-up is not within the goal of a single task; this plugin moves it after the turn ends and runs it separately.
+A DeepSeek Harness (DSH) plugin. After all sessions in this workspace have finished, it automatically runs two commands in series:
+
+1. `git diff` — move shared functions into utils / shared modules, following componentization and modularization, generalizing to all similar cases;
+2. Call skill `cc-git-commit` — sync and push in batches, reviewing the diff critically for hidden risks, bugs, and omissions.
 
 ## Trigger conditions
 
