@@ -105,7 +105,6 @@ export const DEFAULTS = {
       '需要拍板',
       '请你决定',
       'waiting for confirmation',
-      'NEED-DECISION',
     ],
     /** 注入人格后，等它这一轮结束的上限。 */
     decideMaxWaitMs: 600000,

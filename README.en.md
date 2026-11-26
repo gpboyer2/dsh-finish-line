@@ -174,7 +174,9 @@ Uses only host services injected via `ctx` (`sessions` / `agents` / `sessionCont
 npm test        # node --test, 13 tests
 ```
 
-Coverage: config defaults and clamping, persona has no switches (`enabled` / `provider` / `model` / `decideOnStuck` are all absent), persona artifact path is inside the repo, each step's first prompt matching the configured sentence verbatim with no extra prompt, persona intervention via signal detection, detection of "can't decide" signals, validation of question answers (single choice / multiple choice / custom / no options), tolerant parsing of model output.
+Coverage: config defaults and clamping, persona has no switches (`enabled` / `provider` / `model` / `decideOnStuck` are all absent), persona artifact path is inside the repo, persona intervention via signal detection, detection of "can't decide" signals, validation of question answers (single choice / multiple choice / custom / no options), tolerant parsing of model output.
+
+One of them is a **hard constraint**: `buildStagePrompt` output must equal the stage sentence verbatim, and the source must not contain `buildSubagentPrompt` / `subagentRules` / `NEED-DECISION`; both first-prompt sites must call `buildStagePrompt(stage)` directly. Anyone trying to add extra prompt text for subagents makes `npm test` fail — a regression guard for "subagents receive only the sentence".
 
 ## Limits
 

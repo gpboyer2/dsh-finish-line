@@ -174,7 +174,9 @@ test/logic.test.mjs       纯逻辑测试（13 条）
 npm test        # node --test，13 条
 ```
 
-覆盖配置默认值与非法值钳制、人格无开关（enabled/provider/model/decideOnStuck 均不存在）、人格产物路径在仓库内、每步首条提示与配置原文逐字一致（不含任何额外提示词）、人格介入靠信号检测、「定不了」信号识别、提问答案校验（单选 / 多选 / 自定义 / 无选项）、模型输出解析容错。
+覆盖配置默认值与非法值钳制、人格无开关（enabled/provider/model/decideOnStuck 均不存在）、人格产物路径在仓库内、人格介入靠信号检测、「定不了」信号识别、提问答案校验（单选 / 多选 / 自定义 / 无选项）、模型输出解析容错。
+
+其中一条是**硬约束**：`buildStagePrompt` 的输出必须与步骤原话逐字相等，且源码里不得出现 `buildSubagentPrompt` / `subagentRules` / `NEED-DECISION` 字样，两处首条提示必须直接调用 `buildStagePrompt(stage)`。任何人想再给子代理加额外提示词，`npm test` 立刻报错——这是对「子代理只收原话」的回归防线。
 
 ## 边界
 

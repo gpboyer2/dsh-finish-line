@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import path from 'node:path'
 import test from 'node:test'
+import { fileURLToPath } from 'node:url'
 
 import {
   DEFAULTS,
@@ -60,10 +63,27 @@ test('两步首条提示与用户原文逐字相等，一个多余的字都没�
   assert.equal(DEFAULTS.stages[1].prompt, '调用技能 cc-git-commit 同步并推送代码，分批，注意 diff 的过程中批判下、看看有没有隐患、bug、遗漏；')
 })
 
-test('buildStagePrompt 只发一句原话，不夹任何额外提示词', () => {
-  const text = buildStagePrompt(stages[1])
-  assert.equal(text, '批判提交')
-  assert.doesNotMatch(text, /流水线上下文|风格依据|子代理|NEED-DECISION|人格/)
+test('硬约束：buildStagePrompt 的输出与步骤原话逐字相等，任何额外内容都算违约', () => {
+  // 这是对「不要额外提示词」的硬约束：改了 buildStagePrompt 的拼接逻辑、
+  // 往子代理首条消息里塞协议或上下文，这里立刻红。
+  for (const stage of [stages[0], stages[1], { id: 'x', prompt: '随便一句原话\n带换行' }, { id: 'y', prompt: '' }]) {
+    assert.equal(buildStagePrompt(stage), stage.prompt, `步骤 ${stage.id} 的提示词被篡改`)
+  }
+  assert.equal(buildStagePrompt(stages[1]), '批判提交')
+  assert.doesNotMatch(buildStagePrompt(stages[1]), /子代理|NEED-DECISION|人格|协议|流水线|风格依据/)
+})
+
+test('硬约束：源码里不得重新引入拼接额外提示词的函数或配置', () => {
+  // 直接静态检查源码文本：任何人想加回 buildSubagentPrompt、subagentRules
+  // 或在首条消息里拼接协议，测试直接失败。
+  const source = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'index.js'), 'utf8')
+  assert.ok(!/buildSubagentPrompt/.test(source), '不允许重新引入 buildSubagentPrompt')
+  assert.ok(!/subagentRules/.test(source), '不允许重新引入 persona.subagentRules')
+  assert.ok(!/NEED-DECISION/.test(source), '源码里不得出现 NEED-DECISION 协议字样')
+  // 两处发首条提示的位置都必须直接用 buildStagePrompt(stage)，不能有别的拼法。
+  const promptHits = source.match(/text:\s*buildStagePrompt\(stage\)/g) ?? []
+  assert.equal(promptHits.length, 1, `subagent 首条提示必须是 buildStagePrompt(stage)，实际命中 ${promptHits.length} 处`)
+  assert.match(source, /const\s+text\s*=\s*buildStagePrompt\(stage\)/, 'session 首条提示也必须是 buildStagePrompt(stage)')
 })
 
 test('人格介入靠信号检测，不靠给子代理的额外提示词', () => {
