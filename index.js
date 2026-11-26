@@ -11,8 +11,9 @@
  *     27B 默认值拖低）；空对话开始 + 只发两句话，父上下文不会渗进来；子代理
  *     侧边栏隐藏，要接手在父会话的子代理面板里看。代价：子代理**不能**
  *     ask_user_question（宿主以 DELEGATED_CALLER 拒绝），所以遇到「该用户拍板」
- *     的事它汇报 NEED-DECISION，蒸馏人格（本仓库 persona/persona.md）必然替它
- *     拍板，决定发回同一个子代理继续。
+ *     的事它会在汇报里说「定不了」，插件检测到信号就请蒸馏人格（本仓库
+ *     persona/persona.md）替它拍板，决定发回同一个子代理继续。子代理只收
+ *     步骤原话，不预置任何额外提示词。
  *   - `session`：开两个全新顶层会话（侧边栏可见），老路；这条路的人格介入
  *     形态是拦 user-questions/request 代答。
  *
@@ -119,13 +120,6 @@ export const DEFAULTS = {
     maxOutputTokens: 700,
     timeoutMs: 90000,
     retries: 1,
-    /** 子代理模式下写进提示词的规则（session 模式用 PERSONA_RULES）。 */
-    subagentRules: [
-      '- 你是收尾子代理：不能向用户提问（宿主会拒绝），也不要把问题推回父会话。',
-      '- 平时拿得准的决定，按你的工程判断直接定，并在最终汇报里写清「我替你定了什么、为什么」。',
-      '- 但遇到本该由用户拍板的事——业务取舍、要不要扩范围、不可逆操作、改不动方向——在汇报末尾单独一行写「NEED-DECISION：」加具体卡点和候选项，然后停下。蒸馏人格会替你拍板，结果会发回给你，按拍板继续做完，不要回头再问。',
-      '- 不要复述任务、不要空转；干完就停，产出要能让下一个人直接接手。',
-    ].join('\n'),
   },
   logFile: path.join(os.homedir(), '.dsh', 'logs', 'finish-line.log'),
 }
@@ -192,7 +186,6 @@ export function resolveConfig(config = {}) {
       maxOutputTokens: Math.round(clampNumber(persona.maxOutputTokens, 128, 4096, DEFAULTS.persona.maxOutputTokens)),
       timeoutMs: Math.round(clampNumber(persona.timeoutMs, 10000, 600000, DEFAULTS.persona.timeoutMs)),
       retries: Math.round(clampNumber(persona.retries, 0, 3, DEFAULTS.persona.retries)),
-      subagentRules: nonEmptyString(persona.subagentRules, DEFAULTS.persona.subagentRules),
     },
     logFile: nonEmptyString(merged.logFile, DEFAULTS.logFile),
   }
@@ -227,24 +220,11 @@ export function stageTitle(stage, rootTitle) {
 }
 
 /**
- * 首条提示就只是那一步的原话（session 执行器用：那边的人格介入形态是
- * user-questions 代答）；上下文/人格一律不预置。
+ * 首条提示就只是那一步的原话，一个字都不多：上下文/人格/协议一律不预置。
+ * 人格介入不靠告诉子代理任何协议，靠插件对汇报的信号检测自动触发。
  */
 export function buildStagePrompt(stage) {
   return stage.prompt
-}
-
-/**
- * subagent 执行器的首条提示：步骤原话 + NEED-DECISION 协议。
- * 子代理不能向用户提问（宿主拒绝），协议告诉它「该用户拍板的事」
- * 要在汇报末尾单独喊 NEED-DECISION 并停下——人格必然替它拍板，
- * 决定发回同一个子代理继续。没有这段协议，「必然介入」就退化成
- * 靠子代理碰巧说出关键词。
- * @param {object} stage 收尾步骤
- * @param {string} rules NEED-DECISION 协议文本（DEFAULTS.persona.subagentRules）
- */
-export function buildSubagentPrompt(stage, rules) {
-  return `${stage.prompt}\n\n${rules}`
 }
 
 /** 把问题裁剪成给模型看的形状（不出卖宿主内部对象）。 */
@@ -636,11 +616,10 @@ export function apply(ctx, config = {}) {
       const stage = cfg.stages[stageIndex]
       const abort = new AbortController()
       aborts.set(chain.rootId, abort)
-      // 步骤原话 + NEED-DECISION 协议（子代理不能提问，需要用户拍板的事
-      // 靠协议喊出来，人格必然接手）；不传 agentOptions：spawn 继承父会话
+      // 首条提示就一句原话，一个字不多；不传 agentOptions：spawn 继承父会话
       // 的满血模型。
       const request = {
-        prompt: [{ type: 'text', text: buildSubagentPrompt(stage, cfg.persona.subagentRules) }],
+        prompt: [{ type: 'text', text: buildStagePrompt(stage) }],
         parent,
         cwd: chain.cwd,
         maxDepth: 1,
@@ -1028,7 +1007,7 @@ export function apply(ctx, config = {}) {
   })
 
   // 人格代答：只在「新会话」执行器的收尾会话里抢答（必然业务，无开关）；
-  // 子代理模式走 NEED-DECISION 协议 + 拍板发回，其它会话一律 next()，
+  // 子代理模式靠信号检测 + 拍板发回，其它会话一律 next()，
   // 绝不干扰任务会话。
   ctx.on('user-questions/request', async (request, next) => {
     try {

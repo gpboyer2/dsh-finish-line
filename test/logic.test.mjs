@@ -4,7 +4,6 @@ import test from 'node:test'
 import {
   DEFAULTS,
   buildStagePrompt,
-  buildSubagentPrompt,
   needsDecision,
   parseAnswerJson,
   resolveConfig,
@@ -61,21 +60,16 @@ test('两步首条提示与用户原文逐字相等，一个多余的字都没�
   assert.equal(DEFAULTS.stages[1].prompt, '调用技能 cc-git-commit 同步并推送代码，分批，注意 diff 的过程中批判下、看看有没有隐患、bug、遗漏；')
 })
 
-test('buildStagePrompt（session 执行器）只发一句原话，不夹上下文和人格', () => {
+test('buildStagePrompt 只发一句原话，不夹任何额外提示词', () => {
   const text = buildStagePrompt(stages[1])
   assert.equal(text, '批判提交')
-  assert.doesNotMatch(text, /流水线上下文|风格依据|子代理/)
+  assert.doesNotMatch(text, /流水线上下文|风格依据|子代理|NEED-DECISION|人格/)
 })
 
-test('buildSubagentPrompt：步骤原话逐字在前，NEED-DECISION 协议在后', () => {
-  const text = buildSubagentPrompt(stages[1], DEFAULTS.persona.subagentRules)
-  assert.ok(text.startsWith('批判提交\n\n'), '第一步必须是指令原话')
-  assert.ok(text.includes('NEED-DECISION'), '协议必须包含 NEED-DECISION 协议字样')
-  assert.ok(text.includes('蒸馏人格'), '协议必须告诉子代理谁会来拍板')
-})
-
-test('NEED-DECISION 在默认信号词表里（协议与检测两端要咬合）', () => {
-  assert.ok(DEFAULTS.subagent.decideKeywords.includes('NEED-DECISION'))
+test('人格介入靠信号检测，不靠给子代理的额外提示词', () => {
+  assert.ok(DEFAULTS.subagent.decideKeywords.includes('需要拍板'))
+  assert.ok(DEFAULTS.subagent.decideKeywords.includes('无法确定'))
+  assert.ok(!('subagentRules' in DEFAULTS.persona), 'persona.subagentRules 必须不存在')
 })
 
 test('needsDecision 只在子代理自认卡住时才为真', () => {
