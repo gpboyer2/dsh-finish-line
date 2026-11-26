@@ -553,6 +553,39 @@ export function apply(ctx, config = {}) {
     return projectAgents(session).every(agentIdle)
   }
 
+  /** 本项目内是否已有正在跑的收尾链——同一工作区只允许一条，避免多会话各跑一遍。 */
+  function projectHasRunningChain(session) {
+    const workspaceId = workspaceOf(session)?.id
+    const cwd = sessionCwd(session)
+    for (const chain of chains.values()) {
+      if (chain.status !== 'running') continue
+      if (workspaceId !== undefined && chain.workspaceId !== undefined) {
+        if (chain.workspaceId === workspaceId) return true
+      } else if (chain.cwd === cwd) {
+        return true
+      }
+    }
+    return false
+  }
+
+  /** 本项目内本轮是否有会话真正调过工具（纯问答项目不触发收尾）。 */
+  function projectHadToolCall(session) {
+    return projectAgents(session).some((agent) => {
+      const id = agent?.session?.id
+      if (typeof id !== 'string') return false
+      const scoped = sessionsService()?.get(id)
+      return scoped !== undefined && hasToolCall(scoped)
+    })
+  }
+
+  /** 本项目内本轮是否有会话的回合是 completed（被额度卡断/中断的不算）。 */
+  function projectHasCompletedTurn(session) {
+    return projectAgents(session).some((agent) => {
+      const id = agent?.session?.id
+      return typeof id === 'string' && turnEnds.get(id) === 'completed'
+    })
+  }
+
   function hasToolCall(session) {
     if (toolCalled.get(session.id) === true) return true
     try {
@@ -636,21 +669,19 @@ export function apply(ctx, config = {}) {
       return
     }
 
-    // 本项目都空闲了：把本项目里「本轮干完且未收尾」的会话都评估一遍，
-    // 不只当前这一个——避免某个会话先干完、被后来居上的会话挡住而漏收尾。
-    const scoped = projectAgents(session)
-    for (const agent of scoped) {
-      const id = agent?.session?.id
-      if (typeof id !== 'string' || id === '') continue
-      if (stageSessions.has(id)) continue
-      const rootSession = sessionsService()?.get(id)
-      if (rootSession === undefined || rootSession.header.origin === 'subagent') continue
-      await evaluateOne(rootSession)
+    // 同一工作区只跑一条收尾链：已有正在跑的就不再发起，绝不「几个会话各跑一遍」。
+    if (projectHasRunningChain(session)) {
+      log(`本项目已有收尾链在跑，本次不重复发起`)
+      return
     }
+
+    // 由「最后一个完成的会话」——也就是此刻触发本次评估的这个会话——发起
+    // 唯一一条收尾链；git diff 是工作区级的，会把本工作区所有会话的改动一起收拾。
+    await evaluateOne(session)
   }
 
   async function evaluateOne(session) {
-    // 已结束（done / failed）的旧链不挡新一轮：该会话本轮活干完了照样要触发。
+    // 该会话上一条已结束（done / failed）的旧链不挡新一轮：清掉后按本轮重新判定。
     if (chains.has(session.id)) {
       const existing = chains.get(session.id)
       if (existing.status !== 'running') {
@@ -665,14 +696,12 @@ export function apply(ctx, config = {}) {
       log(`会话 ${session.id} 还有排队输入，等它跑完再判断`)
       return
     }
-    if (cfg.requireToolCall && !hasToolCall(session)) return
+    if (cfg.requireToolCall && !projectHadToolCall(session)) return
 
-    // 活必须真干完：只有最近一次 turn/end 是 completed 才触发。被额度卡断
-    // （error）、用户主动中断（aborted）一律不启动收尾。没记录的会话静默跳过。
-    const reasonKind = turnEnds.get(session.id)
-    if (reasonKind === undefined) return
-    if (reasonKind !== 'completed') {
-      log(`会话 ${session.id} 最近一次回合结束原因=${reasonKind}（非 completed），活没干完，不触发收尾`)
+    // 活必须真干完：本项目本轮至少有一个会话的回合是 completed。被额度卡断
+    // （error）、用户主动中断（aborted）不算；全是中断的轮次不启动收尾。
+    if (!projectHasCompletedTurn(session)) {
+      log(`本项目本轮没有 completed 的会话，活没干完，不触发收尾`)
       return
     }
 

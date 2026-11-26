@@ -25,7 +25,7 @@ All conditions must hold at once:
 - The session directory is a Git repository with changes.
 - This session made at least one tool call. Pure Q&A does not trigger.
 
-A previous chain on the same session that has already ended (`done` / `failed`) does not block a new round: it is cleared and the session is re-evaluated. Only a chain currently running is not re-triggered. When the project goes idle, every session in it that finished this round and has not been wrapped up is evaluated — so a session that finished earlier is not missed just because a later one outlasted it.
+A workspace runs **exactly one wrap-up chain, started by the last session to finish** — not one run per session: if A and B finish while some session is still running, nothing happens; when the last session C finishes and finds every session in the workspace idle, C starts this one wrap-up (`git diff` is workspace-wide, so it picks up all changes in the workspace together). While a chain is running, another session finishing in the same workspace does not start a second one. If no session in the project has a `completed` turn this round (all quota-cut or interrupted), nothing starts.
 
 ## How it works
 
