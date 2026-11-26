@@ -55,13 +55,14 @@ turn/end(reason=completed) ──▶ 本项目内所有会话都空闲（无 run
 ## 快速开始
 
 ```sh
-# 1. 克隆到 ~/.dsh/plugins/dsh-finish-line
-git clone https://github.com/gpboyer2/dsh-finish-line.git ~/.dsh/plugins/dsh-finish-line
+# 直接从 GitHub 安装（命令行管理的 profile，如 web / main）
+dsh plugin --profile <你的profile> add github:gpboyer2/dsh-finish-line
 
-# 2. 注册到 profile（命令行管理的 profile，如 web / main）
+# 本地开发：克隆到 ~/.dsh/plugins/dsh-finish-line，改用本地软链安装
+git clone https://github.com/gpboyer2/dsh-finish-line.git ~/.dsh/plugins/dsh-finish-line
 dsh plugin --profile <你的profile> add link:$HOME/.dsh/plugins/dsh-finish-line
 
-# 3. 完整重启 DSH —— Host 插件只在启动时加载
+# 完整重启 DSH —— Host 插件只在启动时加载
 ```
 
 `desktop` profile 由 DeepSeek Harness.app 独占，命令行会被拒。桌面版手动三步：在 `~/.dsh/profiles/desktop/node_modules/` 下建同名软链、`package.json` 的 `dependencies` 加 `"dsh-finish-line": "link:/绝对路径"`、`dsh.profile.bundles` 末尾加 `"dsh-finish-line"`，再重启。在应用内「插件」页安装也一样。

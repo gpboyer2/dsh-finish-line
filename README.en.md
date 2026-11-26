@@ -55,13 +55,14 @@ turn/end(reason=completed) ──▶ all sessions in this project idle (no runni
 ## Quick start
 
 ```sh
-# 1. Clone into ~/.dsh/plugins/dsh-finish-line
-git clone https://github.com/gpboyer2/dsh-finish-line.git ~/.dsh/plugins/dsh-finish-line
+# Install straight from GitHub (a CLI-managed profile such as web / main)
+dsh plugin --profile <your-profile> add github:gpboyer2/dsh-finish-line
 
-# 2. Register with a profile (command-line managed profiles such as web / main)
+# Local development: clone to ~/.dsh/plugins/dsh-finish-line and install through a local link
+git clone https://github.com/gpboyer2/dsh-finish-line.git ~/.dsh/plugins/dsh-finish-line
 dsh plugin --profile <your-profile> add link:$HOME/.dsh/plugins/dsh-finish-line
 
-# 3. Fully restart DSH. Host plugins load only at startup.
+# Fully restart DSH. Host plugins load only at startup.
 ```
 
 The `desktop` profile is owned by DeepSeek Harness.app, and command-line changes to it are rejected. For the desktop build, do it manually in three steps: create a same-named symlink under `~/.dsh/profiles/desktop/node_modules/`, add `"dsh-finish-line": "link:/absolute/path"` to `dependencies` in `package.json`, append `"dsh-finish-line"` to `dsh.profile.bundles`, then restart. Installing from the in-app Plugins page has the same effect.
