@@ -56,6 +56,17 @@ export const inject = ['sessions', 'agents', 'sessionController', 'llm', 'subage
 /** 代答消息的 producer-owned source kind（会话格式 v4 要求）。 */
 const SOURCE_KIND = `plugin:${name}`
 
+/** 手动触发收尾的斜杠命令名（宿主要求匹配 /^[a-z][a-z0-9_-]*$/）。 */
+export const FINISH_COMMAND = 'finish'
+
+/** 手动触发收尾的 HTTP 路由，给会话按钮或外部脚本用。 */
+export const TRIGGER_PATH = '/api/finish-line.trigger'
+
+/** 统一 JSON 响应（路由用）。 */
+function jsonResponse(body, status = 200) {
+  return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
+}
+
 const STATE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000
 const STATE_MAX_CHAINS = 300
 
@@ -696,12 +707,76 @@ export function apply(ctx, config = {}) {
     projectTimers.set(key, { timer, sessionId })
   }
 
+  /** 手动触发时清掉本项目的静默计时器，避免稍后又自动触发一次。 */
+  function clearProjectTimer(session) {
+    const key = projectKey(session)
+    const entry = projectTimers.get(key)
+    if (entry !== undefined) {
+      clearTimeout(entry.timer)
+      projectTimers.delete(key)
+    }
+  }
+
   /** stage 会话结束时立即推进链，不参与静默期。 */
   function scheduleImmediate(session) {
     const timer = setTimeout(() => {
       void evaluate(session).catch((error) => log(`推进收尾链失败：${describeError(error)}`))
     }, 0)
     timer.unref?.()
+  }
+
+  /**
+   * 尝试启动收尾链。自动触发（静默期到期）与手动触发（`/finish` 命令、
+   * HTTP 路由）共用同一套门禁和同一条链；手动只是跳过静默期等待。
+   * 「本项目已有链在跑 / 还有会话在跑」一律拒绝，保证全项目只有一条收尾。
+   * @param {object} session 发起会话
+   * @returns {Promise<{ok: boolean, text: string, busy?: boolean}>}
+   */
+  async function tryStartChain(session) {
+    // 该会话上一条已结束（done / failed）的旧链不挡新一轮：清掉后按本轮重新判定。
+    if (chains.has(session.id)) {
+      const existing = chains.get(session.id)
+      if (existing.status !== 'running') {
+        chains.delete(session.id)
+        for (const sid of existing.sessions) stageSessions.delete(sid)
+        log(`会话 ${session.id} 上有一条已结束的旧链（${existing.status}），清掉后按本轮重新判定`)
+      } else {
+        return { ok: false, text: '该会话的收尾链还在运行。' }
+      }
+    }
+
+    // 同一工作区只跑一条收尾链，不管是谁、从哪个会话触发的。
+    if (projectHasRunningChain(session)) {
+      return { ok: false, text: '本项目已有收尾链在跑，等它结束再来。' }
+    }
+
+    // 本项目其它会话必须都空闲（排除刚结束的触发者自己）。
+    if (!allProjectIdle(session)) {
+      const busy = projectAgents(session)
+        .filter((agent) => agent?.session?.id !== session.id && !agentIdle(agent)).length
+      return { ok: false, busy: true, text: `本项目还有 ${busy} 个其它会话在跑或排队，等它们结束再来。` }
+    }
+
+    if (!inboxIdle(session)) {
+      return { ok: false, text: '该会话还有排队输入，等它跑完再来。' }
+    }
+    if (cfg.requireToolCall && !projectHadToolCall(session)) {
+      return { ok: false, text: '本项目本轮没干过活（没有工具调用），不启动收尾。' }
+    }
+    if (!projectHasCompletedTurn(session)) {
+      return { ok: false, text: '本项目本轮没有正常完成的回合（被中断或额度卡断），不启动收尾。' }
+    }
+
+    const cwd = sessionCwd(session)
+    const git = await gitInfo(cwd)
+    if (!git.repo) return { ok: false, text: `会话不在 Git 仓库（${cwd}），没有可收尾的东西。` }
+    if (!git.dirty) return { ok: false, text: `工作区干净（${cwd}），没有未提交改动。` }
+    const changed = git.status.split('\n').length
+    if (cfg.dryRun) return { ok: false, text: `[dry-run] 有 ${changed} 项改动，本该启动收尾。` }
+
+    clearProjectTimer(session)
+    await startChain(session, cwd, git)
+    return { ok: true, text: `已启动收尾：组件化整理 → 批判提交（${changed} 项改动）。` }
   }
 
   async function evaluate(stale) {
@@ -715,67 +790,11 @@ export function apply(ctx, config = {}) {
       return
     }
 
-    // 门禁：只要**本项目**内还有会话在跑 turn 或排队输入，就整体不启动收尾；
-    // 别的项目的会话与我无关，不等。排除刚结束的自己（status 可能尚未落 idle）。
-    if (!allProjectIdle(session)) {
-      const busy = projectAgents(session)
-        .filter((agent) => agent?.session?.id !== session.id && !agentIdle(agent)).length
-      log(`本项目还有 ${busy} 个其它会话在跑或排队，等它们全部空闲再触发收尾`)
-      touchProject(session) // 兜底：若对方长时间静默但在跑，20 分钟后再看一次
-      return
-    }
-
-    // 同一工作区只跑一条收尾链：已有正在跑的就不再发起，绝不「几个会话各跑一遍」。
-    if (projectHasRunningChain(session)) {
-      log(`本项目已有收尾链在跑，本次不重复发起`)
-      return
-    }
-
-    // 由「最后一个完成的会话」——也就是此刻触发本次评估的这个会话——发起
-    // 唯一一条收尾链；git diff 是工作区级的，会把本工作区所有会话的改动一起收拾。
-    await evaluateOne(session)
-  }
-
-  async function evaluateOne(session) {
-    // 该会话上一条已结束（done / failed）的旧链不挡新一轮：清掉后按本轮重新判定。
-    if (chains.has(session.id)) {
-      const existing = chains.get(session.id)
-      if (existing.status !== 'running') {
-        chains.delete(session.id)
-        for (const sid of existing.sessions) stageSessions.delete(sid)
-        log(`会话 ${session.id} 上有一条已结束的旧链（${existing.status}），清掉后按本轮重新判定`)
-      } else {
-        return
-      }
-    }
-    if (!inboxIdle(session)) {
-      log(`会话 ${session.id} 还有排队输入，等它跑完再判断`)
-      return
-    }
-    if (cfg.requireToolCall && !projectHadToolCall(session)) return
-
-    // 活必须真干完：本项目本轮至少有一个会话的回合是 completed。被额度卡断
-    // （error）、用户主动中断（aborted）不算；全是中断的轮次不启动收尾。
-    if (!projectHasCompletedTurn(session)) {
-      log(`本项目本轮没有 completed 的会话，活没干完，不触发收尾`)
-      return
-    }
-
-    const cwd = sessionCwd(session)
-    const git = await gitInfo(cwd)
-    if (!git.repo) {
-      log(`会话 ${session.id} 不在 Git 仓库（${cwd}），不触发收尾`)
-      return
-    }
-    if (!git.dirty) {
-      log(`会话 ${session.id} 工作区干净（${cwd}），不触发收尾`)
-      return
-    }
-    if (cfg.dryRun) {
-      log(`[dry-run] 会话 ${session.id} 在 ${cwd} 有改动（${git.status.split('\n').length} 项），本该启动收尾链（${cfg.executor}）`)
-      return
-    }
-    await startChain(session, cwd, git)
+    const result = await tryStartChain(session)
+    if (result.ok) return
+    log(`不启动收尾：${result.text}`)
+    // 若只是本项目别的会话还在跑，20 分钟后再看一次（防对方长时间静默但在跑）。
+    if (result.busy === true) touchProject(session)
   }
 
   async function startChain(root, cwd, git) {
@@ -1307,6 +1326,54 @@ export function apply(ctx, config = {}) {
     if (agent.session.header?.origin === 'subagent') return
     // 新开会话也算「本项目有动静」：重置静默计时，避免刚开新会话就收尾。
     touchProject(agent.session)
+  })
+
+  // 手动入口一：斜杠命令 `/finish`。每个会话的 `/` 菜单里都能看到，
+  // 用它跳过 20 分钟静默期、立即启动本项目收尾；同一项目只会有一次。
+  ctx.inject(['commands'], (child) => {
+    child.effect(
+      () => child.commands.register({
+        name: FINISH_COMMAND,
+        description: '立即启动本项目收尾：组件化整理 + 批判提交（不等静默期）',
+        handler: async (invocation) => {
+          if (typeof invocation?.rawInput === 'string' && invocation.rawInput.trim() !== '') {
+            return { kind: 'error', text: `/${FINISH_COMMAND} 不接受参数。` }
+          }
+          const session = invocation?.agent?.session
+          if (session === undefined) return { kind: 'error', text: '拿不到当前会话，无法收尾。' }
+          const result = await tryStartChain(session)
+          log(`/${FINISH_COMMAND} 手动触发：${result.ok ? '已启动' : '未启动'} —— ${result.text}`)
+          return { kind: result.ok ? 'success' : 'error', text: result.text }
+        }
+      }),
+      'finish-line: /finish command'
+    )
+  })
+
+  // 手动入口二：HTTP 路由，给将来的会话头部按钮或外部脚本用。
+  ctx.inject(['connection'], (child) => {
+    child.effect(
+      () => child.connection.fetch.register({
+        path: TRIGGER_PATH,
+        methods: ['POST'],
+        requestBody: 'buffered',
+        fetch: async (request) => {
+          let body
+          try {
+            body = await request.json()
+          } catch {
+            return jsonResponse({ ok: false, error: 'bad request' }, 400)
+          }
+          const sessionId = typeof body?.sessionId === 'string' ? body.sessionId : ''
+          const session = sessionId === '' ? undefined : sessionsService()?.get(sessionId)
+          if (session === undefined) return jsonResponse({ ok: false, error: 'unknown session' }, 404)
+          const result = await tryStartChain(session)
+          log(`HTTP 手动触发 session=${sessionId}：${result.ok ? '已启动' : '未启动'} —— ${result.text}`)
+          return jsonResponse({ ok: result.ok, text: result.text })
+        }
+      }),
+      'finish-line: trigger route'
+    )
   })
 
   ctx.effect(() => {

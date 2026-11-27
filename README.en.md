@@ -70,7 +70,7 @@ The `desktop` profile is owned by DeepSeek Harness.app, and command-line changes
 
 The bundled `cordis.patch.yml` inserts the plugin line and sets the executor to `subagent`; no manual edit of the profile's patch file is needed.
 
-To verify: in a Git repository with changes, have the AI run a small task that makes a tool call. Wait 20 seconds, then check `~/.dsh/logs/finish-line.log` for `启动收尾链` and the `子代理已启动` / `结束` lines of both steps.
+To verify: in a Git repository with changes, have the AI run a small task that makes a tool call, then type `/finish` (no 20-minute wait) and check `~/.dsh/logs/finish-line.log` for `启动收尾链` and the `子代理已启动` / `结束` lines of both steps.
 
 On a first install, run with `dryRun: true`: logs only, no code changes. Turn it off once the trigger timing is confirmed.
 
@@ -80,6 +80,7 @@ On a first install, run with `dryRun: true`: logs only, no code changes. Turn it
 | --- | --- |
 | Auto trigger | Acts only when every trigger condition holds; no fuzzy matching. |
 | Idle period | Starts only after 20 minutes of no activity in this project; any activity resets the timer, so it never collides with you coming back to continue. |
+| Manual early run | Type `/finish` in any session to start this project's wrap-up immediately, skipping the idle wait; the project shares one chain, so repeat triggers are refused. |
 | Two serial steps | The next step starts only after the previous step's subagent ends; order is changed in `stages`. |
 | Empty-conversation subagents | No inherited chat history or injected context; only the step sentence, nothing more. |
 | Model inheritance | `agentOptions: null`; keeps the parent session's model and reasoning tier. |
@@ -89,6 +90,21 @@ On a first install, run with `dryRun: true`: logs only, no code changes. Turn it
 | Visible answering | When the persona answers, the question, all options, and the persona's choice are appended to the stage session as a message you can see; a JSONL ledger is written as well. |
 | dry-run | Writes the decision and logs only; starts no subagent, changes no code. |
 | Zero dependencies | Only host services injected by DSH and Node built-in modules. |
+
+## Manual early run
+
+When you do not want to wait 20 minutes, type this in **any session of this project**:
+
+```
+/finish
+```
+
+It appears in the `/` menu as "立即启动本项目收尾：组件化整理 + 批判提交（不等静默期）".
+
+- **Every session can use it**, but **the whole project shares one wrap-up marker**: if this project already has a chain running, another trigger is refused ("本项目已有收尾链在跑") instead of running once per session.
+- The same gates still apply: every other session in the project must be idle, this round must have a `completed` turn, and the repo must have uncommitted changes. Anything missing is reported back (for example "工作区干净，没有未提交改动").
+- It starts the same chain: componentization cleanup → critical commit, with a workspace-wide `git diff` covering every session's changes.
+- HTTP is available too: `POST /api/finish-line.trigger` with `{"sessionId":"session-..."}` returns `{"ok":true|false,"text":"..."}` — for a future header button or external scripts.
 
 ## Configuration
 

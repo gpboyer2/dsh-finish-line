@@ -6,6 +6,8 @@ import { fileURLToPath } from 'node:url'
 
 import {
   DEFAULTS,
+  FINISH_COMMAND,
+  TRIGGER_PATH,
   buildStagePrompt,
   formatDecisionMessage,
   needsDecision,
@@ -179,4 +181,11 @@ test('othersIdle 必须排除触发评估的自己（status 可能尚未落 idle
   assert.equal(othersIdle([selfRunning, otherQueued], 'a'), false)
   // 空列表 → 通过
   assert.equal(othersIdle([], 'a'), true)
+})
+
+test('手动触发入口：/finish 命令名符合宿主规则，路由路径固定', () => {
+  // 宿主 dsh-commands 的 COMMAND_NAME 规则
+  assert.match(FINISH_COMMAND, /^[a-z][a-z0-9_-]*$/)
+  assert.equal(FINISH_COMMAND, 'finish')
+  assert.equal(TRIGGER_PATH, '/api/finish-line.trigger')
 })
