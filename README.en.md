@@ -20,7 +20,8 @@ A DeepSeek Harness (DSH) plugin. After all sessions in this workspace have finis
 
 All conditions must hold at once:
 
-- **All sessions in this project are idle**: within this project (same workspace), no session is running a `turn` (`agent.status === 'running'`, including waiting on an approval or answer) and none has queued input. If any session in this project is still working or queued, nothing starts — **it keys off the queue, not how long it has been silent**. Sessions in other projects do not matter and are not waited on.
+- **All sessions in this project are idle**: within this project (same workspace), no session is running a `turn` (`agent.status === 'running'`, including waiting on an approval or answer) and none has queued input. Sessions in other projects do not matter and are not waited on.
+- **Idle period**: after the project's last activity, a full `idleMs` (**20 minutes** by default) must pass with no activity at all. Sending another message, opening a new session, another session working, a tool call — any of these counts as activity and **resets the timer**. This prevents colliding with wrap-up subagents that are already running when you come back with a new idea a few minutes later.
 - **The work must actually be done**: the most recent `turn/end` reason must be `completed`. Quota-cut short (`error`), user interruption (`aborted`), or anything else never triggers — unfinished work does not enter the wrap-up.
 - The session directory is a Git repository with changes.
 - This session made at least one tool call. Pure Q&A does not trigger.
@@ -30,7 +31,7 @@ A workspace runs **exactly one wrap-up chain, started by the last session to fin
 ## How it works
 
 ```
-turn/end(reason=completed) ──▶ all sessions in this project idle (no running turn, no queue)
+all sessions in this project idle ──▶ 20 minutes with no activity (any activity resets it)
                                             │
                                             ▼
                               check: Git repo && changes && tool called && work done
@@ -77,7 +78,8 @@ On a first install, run with `dryRun: true`: logs only, no code changes. Turn it
 
 | Capability | Description |
 | --- | --- |
-| Auto trigger | Acts only when all four trigger conditions hold; no fuzzy matching. |
+| Auto trigger | Acts only when every trigger condition holds; no fuzzy matching. |
+| Idle period | Starts only after 20 minutes of no activity in this project; any activity resets the timer, so it never collides with you coming back to continue. |
 | Two serial steps | The next step starts only after the previous step's subagent ends; order is changed in `stages`. |
 | Empty-conversation subagents | No inherited chat history or injected context; only the step sentence, nothing more. |
 | Model inheritance | `agentOptions: null`; keeps the parent session's model and reasoning tier. |
@@ -107,6 +109,7 @@ Override the plugin line's `config:` in `~/.dsh/profiles/desktop/cordis.patch.ym
 | `enabled` | `true` | Master switch. |
 | `executor` | `subagent` | `subagent`: in-process spawn, empty conversation, not listed in the sidebar; `session`: two new top-level sessions, visible in the sidebar. |
 | `dryRun` | `false` | Logs only, no real run. |
+| `idleMs` | `1200000` (20 min) | Idle period: how long the project must be quiet after its last activity. Any activity resets the timer. |
 | `requireToolCall` | `true` | Triggers only if the session made at least one tool call. |
 | `maxChainAgeMs` | `21600000` | A chain lives at most 6 hours; after that it is not resumed. |
 | `gitTimeoutMs` | `8000` | Per-call timeout for `git status` / `git diff`. |

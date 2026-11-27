@@ -69,6 +69,12 @@ export const DEFAULTS = {
   executor: 'subagent',
   /** 只写日志、不真跑（首次安装先观察用）。 */
   dryRun: false,
+  /**
+   * 静默期：本项目最后一次活动之后，整整这段时间没有任何动静（继续说话、
+   * 新开会话、别的会话干活都算动静）才启动收尾。默认 20 分钟，避免用户
+   * 灵光一闪回来接着干时和已在跑的收尾子代理撞车。
+   */
+  idleMs: 20 * 60 * 1000,
   /** 本次会话至少发生过一次工具调用才算「干过活」，纯问答不触发。 */
   requireToolCall: true,
   maxChainAgeMs: 6 * 60 * 60 * 1000,
@@ -164,6 +170,7 @@ export function resolveConfig(config = {}) {
     enabled: merged.enabled !== false,
     executor: merged.executor === 'session' ? 'session' : 'subagent',
     dryRun: merged.dryRun === true,
+    idleMs: Math.round(clampNumber(merged.idleMs, 30000, 2 * 60 * 60 * 1000, DEFAULTS.idleMs)),
     requireToolCall: merged.requireToolCall !== false,
     maxChainAgeMs: Math.round(clampNumber(merged.maxChainAgeMs, 60000, 7 * 24 * 3600 * 1000, DEFAULTS.maxChainAgeMs)),
     gitTimeoutMs: Math.round(clampNumber(merged.gitTimeoutMs, 1000, 60000, DEFAULTS.gitTimeoutMs)),
@@ -370,7 +377,8 @@ export function apply(ctx, config = {}) {
   const cfg = resolveConfig(config)
   const chains = new Map()
   const stageSessions = new Map()
-  const timers = new Map()
+  /** 项目级静默计时器：key（workspaceId 或 cwd）→ { timer, sessionId }。 */
+  const projectTimers = new Map()
   const toolCalled = new Map()
   const aborts = new Map()
   const childWaiters = new Map()
@@ -664,17 +672,36 @@ export function apply(ctx, config = {}) {
     return stageSessions.has(sessionId)
   }
 
-  function scheduleCheck(session) {
-    const previous = timers.get(session.id)
-    if (previous !== undefined) clearTimeout(previous)
-    // 不再用「静默 N 秒」判定：turn/end 后下一拍就评估，靠「所有会话是否空闲」
-    // 这个真实状态来决定。延迟 0 只是让 agent.status 从 running 落到 idle。
+  /** 项目标识：同一 workspace 算一个项目；拿不到就用 cwd。 */
+  function projectKey(session) {
+    return workspaceOf(session)?.id ?? sessionCwd(session)
+  }
+
+  /**
+   * 记一次「本项目有动静」：重置静默计时。
+   * 任何活动（继续说话、新开会话、别的会话干活）都调这个；只有整整
+   * cfg.idleMs（默认 20 分钟）内一次动静都没有，才真正去评估收尾。
+   */
+  function touchProject(session) {
+    const key = projectKey(session)
+    const previous = projectTimers.get(key)
+    if (previous !== undefined) clearTimeout(previous.timer)
+    const sessionId = session.id
     const timer = setTimeout(() => {
-      timers.delete(session.id)
-      void evaluate(session).catch((error) => log(`评估会话 ${session.id} 失败：${describeError(error)}`))
+      projectTimers.delete(key)
+      const live = sessionsService()?.get(sessionId) ?? session
+      void evaluate(live).catch((error) => log(`评估会话 ${sessionId} 失败：${describeError(error)}`))
+    }, cfg.idleMs)
+    timer.unref?.()
+    projectTimers.set(key, { timer, sessionId })
+  }
+
+  /** stage 会话结束时立即推进链，不参与静默期。 */
+  function scheduleImmediate(session) {
+    const timer = setTimeout(() => {
+      void evaluate(session).catch((error) => log(`推进收尾链失败：${describeError(error)}`))
     }, 0)
     timer.unref?.()
-    timers.set(session.id, timer)
   }
 
   async function evaluate(stale) {
@@ -694,6 +721,7 @@ export function apply(ctx, config = {}) {
       const busy = projectAgents(session)
         .filter((agent) => agent?.session?.id !== session.id && !agentIdle(agent)).length
       log(`本项目还有 ${busy} 个其它会话在跑或排队，等它们全部空闲再触发收尾`)
+      touchProject(session) // 兜底：若对方长时间静默但在跑，20 分钟后再看一次
       return
     }
 
@@ -1174,6 +1202,14 @@ export function apply(ctx, config = {}) {
   ctx.on('session/event', (session, event) => {
     if (cfg.enabled !== true) return
     try {
+      // 任何活动都算「本项目有动静」：继续说话、新会话开干、别的会话干活，
+      // 都重置静默计时。收尾链自己的 stage 会话、以及子代理会话不算
+      //（前者是链的一部分，后者属于链内部干活）。
+      const isStage = stageSessions.has(session.id)
+      const isSubagent = session.header?.origin === 'subagent'
+      if (!isStage && !isSubagent && (event.type === 'tool/call' || event.type === 'user/message' || event.type === 'turn/start' || event.type === 'turn/end')) {
+        touchProject(session)
+      }
       if (event.type === 'tool/call') {
         toolCalled.set(session.id, true)
         return
@@ -1188,7 +1224,8 @@ export function apply(ctx, config = {}) {
           for (const entry of waiters) entry.finish?.(text)
         }, 0)
       }
-      scheduleCheck(session)
+      // stage 会话结束要立即推进下一步；任务会话只重置静默计时，到期再评估。
+      if (isStage) scheduleImmediate(session)
     } catch (error) {
       log(`处理会话事件失败：${describeError(error)}`)
     }
@@ -1263,16 +1300,21 @@ export function apply(ctx, config = {}) {
 
   ctx.on('agent/created', ({ agent }) => {
     if (agent === undefined || typeof agent.session?.id !== 'string') return
-    if (!isStageSession(agent.session.id)) return
-    log(`收尾会话 ${agent.session.id} 的 agent 已就绪，代答生效`)
+    if (isStageSession(agent.session.id)) {
+      log(`收尾会话 ${agent.session.id} 的 agent 已就绪，代答生效`)
+      return
+    }
+    if (agent.session.header?.origin === 'subagent') return
+    // 新开会话也算「本项目有动静」：重置静默计时，避免刚开新会话就收尾。
+    touchProject(agent.session)
   })
 
   ctx.effect(() => {
     loadState()
-    log(`已启用（executor=${cfg.executor}，排队空闲才收尾，persona=${cfg.persona.file}，dryRun=${cfg.dryRun}）`)
+    log(`已启用（executor=${cfg.executor}，静默 ${Math.round(cfg.idleMs / 60000)} 分钟无动静才收尾，persona=${cfg.persona.file}，dryRun=${cfg.dryRun}）`)
     return () => {
-      for (const timer of timers.values()) clearTimeout(timer)
-      timers.clear()
+      for (const entry of projectTimers.values()) clearTimeout(entry.timer)
+      projectTimers.clear()
       for (const abort of aborts.values()) abort.abort()
       aborts.clear()
     }

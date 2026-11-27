@@ -29,13 +29,12 @@ test('resolveConfig 默认值：subagent 执行器、不传 agentOptions（继�
   assert.equal(cfg.stages.length, 2)
 })
 
-test('已放弃静默计时：配置里不再有 quietMs，传了也不生效', () => {
-  const cfg = resolveConfig({ quietMs: 1 })
-  assert.ok(!('quietMs' in cfg), 'quietMs 必须已移除')
-  const cfg2 = resolveConfig({ quietMs: 999999, executor: 'whatever', stages: [] })
-  assert.ok(!('quietMs' in cfg2))
-  assert.equal(cfg2.executor, 'subagent')
-  assert.equal(cfg2.stages.length, 2)
+test('静默期 idleMs 默认 20 分钟，越界被钳制', () => {
+  assert.equal(resolveConfig({}).idleMs, 20 * 60 * 1000)
+  assert.equal(resolveConfig({ idleMs: 1 }).idleMs, 30000, '低于 30 秒钳到 30 秒')
+  assert.equal(resolveConfig({ idleMs: 9 * 60 * 60 * 1000 }).idleMs, 2 * 60 * 60 * 1000, '高于 2 小时钳到 2 小时')
+  // 旧的 quietMs 已彻底移除，传了也不生效
+  assert.ok(!('quietMs' in resolveConfig({ quietMs: 1 })))
 })
 
 test('人格不是开关：enabled/provider/model/decideOnStuck 谁传都进不来', () => {
