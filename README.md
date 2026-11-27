@@ -8,7 +8,7 @@
 ![Node.js](https://img.shields.io/badge/Node.js-22%2B-339933?style=flat-square&logo=node.js&logoColor=white)
 ![JavaScript](https://img.shields.io/badge/JavaScript-ESM-F7DF1E?style=flat-square&logo=javascript&logoColor=black)
 ![Cordis](https://img.shields.io/badge/Cordis-plugin-FF6B6B?style=flat-square)
-![tests](https://img.shields.io/badge/tests-15-brightgreen?style=flat-square)
+![tests](https://img.shields.io/badge/tests-16-brightgreen?style=flat-square)
 ![license](https://img.shields.io/badge/license-MIT-brightgreen?style=flat-square)
 
 一个 DeepSeek Harness（DSH）插件。本工作区的所有会话都完成（结束）后，自动、串行地调用两段命令：
@@ -168,7 +168,7 @@ cordis.patch.yml          bundle patch：插入插件行并给默认配置
 locale/zh.json            插件市场里的中文名与一句话描述
 locale/en.json            英文名与描述
 icon.svg                  插件图标
-test/logic.test.mjs       纯逻辑测试（15 条）
+test/logic.test.mjs       纯逻辑测试（16 条）
 ```
 
 只用 `ctx` 注入的宿主服务（`sessions` / `agents` / `sessionController` / `llm` / `subagents` / `agentDefaultModel`）与 Node 内置模块；没有构建步骤；状态与日志都落在 `~/.dsh` 下。
@@ -176,7 +176,7 @@ test/logic.test.mjs       纯逻辑测试（15 条）
 ## 测试
 
 ```sh
-npm test        # node --test，15 条
+npm test        # node --test，16 条
 ```
 
 覆盖配置默认值与非法值钳制、人格无开关（enabled/provider/model/decideOnStuck 均不存在）、人格产物路径在仓库内、人格介入靠信号检测、「定不了」信号识别、提问答案校验（单选 / 多选 / 自定义 / 无选项）、模型输出解析容错。

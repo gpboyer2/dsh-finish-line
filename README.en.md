@@ -8,7 +8,7 @@
 ![Node.js](https://img.shields.io/badge/Node.js-22%2B-339933?style=flat-square&logo=node.js&logoColor=white)
 ![JavaScript](https://img.shields.io/badge/JavaScript-ESM-F7DF1E?style=flat-square&logo=javascript&logoColor=black)
 ![Cordis](https://img.shields.io/badge/Cordis-plugin-FF6B6B?style=flat-square)
-![tests](https://img.shields.io/badge/tests-15-brightgreen?style=flat-square)
+![tests](https://img.shields.io/badge/tests-16-brightgreen?style=flat-square)
 ![license](https://img.shields.io/badge/license-MIT-brightgreen?style=flat-square)
 
 A DeepSeek Harness (DSH) plugin. After all sessions in this workspace have finished, it automatically runs two commands in series:
@@ -168,7 +168,7 @@ cordis.patch.yml        bundle patch: inserts the plugin line and supplies defau
 locale/zh.json          Chinese name and one-line description for the plugin market
 locale/en.json          English name and description
 icon.svg                Plugin icon
-test/logic.test.mjs     Pure-logic tests (15)
+test/logic.test.mjs     Pure-logic tests (16)
 ```
 
 Uses only host services injected via `ctx` (`sessions` / `agents` / `sessionController` / `llm` / `subagents` / `agentDefaultModel`) and Node built-in modules; no build step; state and logs both live under `~/.dsh`.
@@ -176,7 +176,7 @@ Uses only host services injected via `ctx` (`sessions` / `agents` / `sessionCont
 ## Tests
 
 ```sh
-npm test        # node --test, 15 tests
+npm test        # node --test, 16 tests
 ```
 
 Coverage: config defaults and clamping, persona has no switches (`enabled` / `provider` / `model` / `decideOnStuck` are all absent), persona artifact path is inside the repo, persona intervention via signal detection, detection of "can't decide" signals, validation of question answers (single choice / multiple choice / custom / no options), tolerant parsing of model output.

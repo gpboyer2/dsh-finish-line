@@ -9,6 +9,7 @@ import {
   buildStagePrompt,
   formatDecisionMessage,
   needsDecision,
+  othersIdle,
   parseAnswerJson,
   resolveConfig,
   stageTitle,
@@ -163,4 +164,20 @@ test('parseAnswerJson 容忍代码围栏与前后废话', () => {
   assert.deepEqual(parseAnswerJson('好的：\n```json\n{"answers":[]}\n```\n完'), { answers: [] })
   assert.deepEqual(parseAnswerJson('前言 {"answers":[]} 后语'), { answers: [] })
   assert.throws(() => parseAnswerJson('没有 JSON'))
+})
+
+test('othersIdle 必须排除触发评估的自己（status 可能尚未落 idle）', () => {
+  const selfRunning = { session: { id: 'a' }, status: 'running', inbox: { nextTurn: [], nextStep: [] } }
+  const otherIdle = { session: { id: 'b' }, status: 'idle', inbox: { nextTurn: [], nextStep: [] } }
+  const otherRunning = { session: { id: 'c' }, status: 'running', inbox: { nextTurn: [], nextStep: [] } }
+  const otherQueued = { session: { id: 'd' }, status: 'idle', inbox: { nextTurn: [{}], nextStep: [] } }
+
+  // 只有自己还在 running（状态滞后）→ 别人都空闲 → 通过
+  assert.equal(othersIdle([selfRunning], 'a'), true)
+  assert.equal(othersIdle([selfRunning, otherIdle], 'a'), true)
+  // 别的会话真在跑或排队 → 不通过
+  assert.equal(othersIdle([selfRunning, otherIdle, otherRunning], 'a'), false)
+  assert.equal(othersIdle([selfRunning, otherQueued], 'a'), false)
+  // 空列表 → 通过
+  assert.equal(othersIdle([], 'a'), true)
 })

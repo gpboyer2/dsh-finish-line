@@ -328,6 +328,23 @@ export function needsDecision(text, keywords) {
   return keywords.some((keyword) => typeof keyword === 'string' && keyword !== '' && text.includes(keyword))
 }
 
+/**
+ * 除 `selfId` 之外的 agent 是否都空闲（不在跑 turn、无排队输入）。
+ *
+ * 必须排除自己：触发评估的会话刚 turn/end，`agent.status` 可能还没落到
+ * idle。把它算进去就会误判成「还有会话在跑」，而它不会再产生 turn/end，
+ * 收尾就永远不触发（2026-11-26 session-c9f08656 就是这么漏的）。
+ * @param {Array} agents 本项目内的 agent 列表
+ * @param {string} selfId 触发本次评估的会话 id
+ */
+export function othersIdle(agents, selfId) {
+  return agents
+    .filter((agent) => agent !== undefined && agent?.session?.id !== selfId)
+    .every((agent) => agent.status !== 'running'
+      && (Array.isArray(agent.inbox?.nextTurn) ? agent.inbox.nextTurn.length : 0) === 0
+      && (Array.isArray(agent.inbox?.nextStep) ? agent.inbox.nextStep.length : 0) === 0)
+}
+
 /** 从子代理结果里取纯文本（写日志用）。 */
 export function resultText(result) {
   try {
@@ -499,10 +516,15 @@ export function apply(ctx, config = {}) {
     return ''
   }
 
+  /**
+   * 只看排队输入是否清空，不看 agent.status。
+   * 病根：turn/end 提交时 agent.status 还是 'running'，要等 driver 后续微任务
+   * 才落到 'idle'。若这里看 status，刚结束的会话会被判成「还在跑」，而它不会
+   * 再产生下一次 turn/end，于是永远不再评估。
+   */
   function inboxIdle(session) {
     const agent = liveAgent(session.id)
     if (agent === undefined) return true
-    if (agent.status === 'running') return false
     const nextTurn = Array.isArray(agent.inbox?.nextTurn) ? agent.inbox.nextTurn.length : 0
     const nextStep = Array.isArray(agent.inbox?.nextStep) ? agent.inbox.nextStep.length : 0
     return nextTurn === 0 && nextStep === 0
@@ -548,9 +570,14 @@ export function apply(ctx, config = {}) {
     return scoped.length > 0 ? scoped : [liveAgent(session.id)].filter(Boolean)
   }
 
-  /** 本项目（不是整个 DSH）内的会话是否都空闲。 */
+  /**
+   * 本项目内除「触发本次评估的会话自己」以外的会话是否都空闲。
+   * 必须排除自己：它刚 turn/end，status 可能还没落到 idle；把它算进去就会
+   * 出现「本项目还有 1 个会话在跑」——而那个 1 个正是它自己，之后它不会
+   * 再产生 turn/end，收尾就永远不触发。
+   */
   function allProjectIdle(session) {
-    return projectAgents(session).every(agentIdle)
+    return othersIdle(projectAgents(session), session.id)
   }
 
   /** 本项目内是否已有正在跑的收尾链——同一工作区只允许一条，避免多会话各跑一遍。 */
@@ -662,10 +689,11 @@ export function apply(ctx, config = {}) {
     }
 
     // 门禁：只要**本项目**内还有会话在跑 turn 或排队输入，就整体不启动收尾；
-    // 别的项目的会话与我无关，不等。每次 turn/end 都会再触发一次评估。
+    // 别的项目的会话与我无关，不等。排除刚结束的自己（status 可能尚未落 idle）。
     if (!allProjectIdle(session)) {
-      const busy = projectAgents(session).filter((agent) => !agentIdle(agent)).length
-      log(`本项目还有 ${busy} 个会话在跑或排队，等它们全部空闲再触发收尾`)
+      const busy = projectAgents(session)
+        .filter((agent) => agent?.session?.id !== session.id && !agentIdle(agent)).length
+      log(`本项目还有 ${busy} 个其它会话在跑或排队，等它们全部空闲再触发收尾`)
       return
     }
 
