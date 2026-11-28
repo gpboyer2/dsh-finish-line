@@ -347,20 +347,19 @@ export function needsDecision(text, keywords) {
 }
 
 /**
- * 除 `selfId` 之外的 agent 是否都空闲（不在跑 turn、无排队输入）。
+ * 这些 agent 是否都空闲（不在跑 turn、无排队输入）。
  *
- * 必须排除自己：触发评估的会话刚 turn/end，`agent.status` 可能还没落到
- * idle。把它算进去就会误判成「还有会话在跑」，而它不会再产生 turn/end，
- * 收尾就永远不触发（2026-11-26 session-c9f08656 就是这么漏的）。
- * @param {Array} agents 本项目内的 agent 列表
- * @param {string} selfId 触发本次评估的会话 id
+ * **必须把自己也算进去**：2026-11-28 session-f3348634 就是触发会话自己还在
+ * 干活（turn 1 跑了 40 分钟），旧的「排除自己」逻辑把它当空闲放行，收尾链
+ * 在它干到一半时就启动了。现在用 20 分钟静默计时，触发时 status 早已稳定，
+ * 不需要再为「turn/end 后 status 短暂滞后」让路。
+ * @param {Array} agents 本项目内的 agent 列表（含触发会话自己）
  */
-export function othersIdle(agents, selfId) {
-  return agents
-    .filter((agent) => agent !== undefined && agent?.session?.id !== selfId)
-    .every((agent) => agent.status !== 'running'
+export function allIdle(agents) {
+  return agents.every((agent) => agent === undefined
+    || (agent.status !== 'running'
       && (Array.isArray(agent.inbox?.nextTurn) ? agent.inbox.nextTurn.length : 0) === 0
-      && (Array.isArray(agent.inbox?.nextStep) ? agent.inbox.nextStep.length : 0) === 0)
+      && (Array.isArray(agent.inbox?.nextStep) ? agent.inbox.nextStep.length : 0) === 0))
 }
 
 /** 从子代理结果里取纯文本（写日志用）。 */
@@ -596,7 +595,8 @@ export function apply(ctx, config = {}) {
    * 再产生 turn/end，收尾就永远不触发。
    */
   function allProjectIdle(session) {
-    return othersIdle(projectAgents(session), session.id)
+    // 含触发会话自己：它自己必须也空闲，绝不能「活没干完就开始收尾」。
+    return allIdle(projectAgents(session))
   }
 
   /** 本项目内是否已有正在跑的收尾链——同一工作区只允许一条，避免多会话各跑一遍。 */
@@ -683,9 +683,37 @@ export function apply(ctx, config = {}) {
     return stageSessions.has(sessionId)
   }
 
-  /** 项目标识：同一 workspace 算一个项目；拿不到就用 cwd。 */
+  /**
+   * 项目标识：同一 workspace 算一个项目；拿不到就用 cwd。
+   *
+   * 必须按会话缓存、冻结第一次算出的值：会话刚创建时 workspace 往往还没
+   * 注册（agent/created 先于 workspace 落库），此时算出的 key 是 cwd；
+   * 到 turn/start 时 workspace 已注册，key 变成 workspaceId。key 一变，
+   * 早先按 cwd 设的计时器就再也清不掉，20 分钟后在会话正干活时炸掉
+   * （2026-11-28 session-f3348634 就是这么提前收尾的）。
+   */
+  const projectKeyCache = new Map()
+
   function projectKey(session) {
-    return workspaceOf(session)?.id ?? sessionCwd(session)
+    const cached = projectKeyCache.get(session.id)
+    const workspaceId = workspaceOf(session)?.id
+    if (workspaceId !== undefined) {
+      // workspace 一旦可用，就把 key 从 cwd 迁到 workspaceId，并清掉旧 key
+      // 下遗留的计时器——否则它会在会话正干活时按旧时间炸掉。
+      if (cached !== undefined && cached !== workspaceId) {
+        const stale = projectTimers.get(cached)
+        if (stale !== undefined) {
+          clearTimeout(stale.timer)
+          projectTimers.delete(cached)
+        }
+      }
+      if (cached !== workspaceId) projectKeyCache.set(session.id, workspaceId)
+      return workspaceId
+    }
+    if (cached !== undefined) return cached
+    const key = sessionCwd(session)
+    projectKeyCache.set(session.id, key)
+    return key
   }
 
   /**
@@ -752,9 +780,8 @@ export function apply(ctx, config = {}) {
 
     // 本项目其它会话必须都空闲（排除刚结束的触发者自己）。
     if (!allProjectIdle(session)) {
-      const busy = projectAgents(session)
-        .filter((agent) => agent?.session?.id !== session.id && !agentIdle(agent)).length
-      return { ok: false, busy: true, text: `本项目还有 ${busy} 个其它会话在跑或排队，等它们结束再来。` }
+      const busy = projectAgents(session).filter((agent) => !agentIdle(agent)).length
+      return { ok: false, busy: true, text: `本项目还有 ${busy} 个会话在跑或排队（含当前会话），等它们结束再来。` }
     }
 
     if (!inboxIdle(session)) {
@@ -1382,6 +1409,7 @@ export function apply(ctx, config = {}) {
     return () => {
       for (const entry of projectTimers.values()) clearTimeout(entry.timer)
       projectTimers.clear()
+      projectKeyCache.clear()
       for (const abort of aborts.values()) abort.abort()
       aborts.clear()
     }

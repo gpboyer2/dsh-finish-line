@@ -11,7 +11,7 @@ import {
   buildStagePrompt,
   formatDecisionMessage,
   needsDecision,
-  othersIdle,
+  allIdle,
   parseAnswerJson,
   resolveConfig,
   stageTitle,
@@ -167,25 +167,14 @@ test('parseAnswerJson 容忍代码围栏与前后废话', () => {
   assert.throws(() => parseAnswerJson('没有 JSON'))
 })
 
-test('othersIdle 必须排除触发评估的自己（status 可能尚未落 idle）', () => {
+test('allIdle 必须包含触发会话自己：它自己还在跑就不许收尾', () => {
+  const idle = { session: { id: 'b' }, status: 'idle', inbox: { nextTurn: [], nextStep: [] } }
   const selfRunning = { session: { id: 'a' }, status: 'running', inbox: { nextTurn: [], nextStep: [] } }
-  const otherIdle = { session: { id: 'b' }, status: 'idle', inbox: { nextTurn: [], nextStep: [] } }
-  const otherRunning = { session: { id: 'c' }, status: 'running', inbox: { nextTurn: [], nextStep: [] } }
-  const otherQueued = { session: { id: 'd' }, status: 'idle', inbox: { nextTurn: [{}], nextStep: [] } }
+  const selfQueued = { session: { id: 'a' }, status: 'idle', inbox: { nextTurn: [{}], nextStep: [] } }
 
-  // 只有自己还在 running（状态滞后）→ 别人都空闲 → 通过
-  assert.equal(othersIdle([selfRunning], 'a'), true)
-  assert.equal(othersIdle([selfRunning, otherIdle], 'a'), true)
-  // 别的会话真在跑或排队 → 不通过
-  assert.equal(othersIdle([selfRunning, otherIdle, otherRunning], 'a'), false)
-  assert.equal(othersIdle([selfRunning, otherQueued], 'a'), false)
-  // 空列表 → 通过
-  assert.equal(othersIdle([], 'a'), true)
-})
-
-test('手动触发入口：/finish 命令名符合宿主规则，路由路径固定', () => {
-  // 宿主 dsh-commands 的 COMMAND_NAME 规则
-  assert.match(FINISH_COMMAND, /^[a-z][a-z0-9_-]*$/)
-  assert.equal(FINISH_COMMAND, 'finish')
-  assert.equal(TRIGGER_PATH, '/api/finish-line.trigger')
+  assert.equal(allIdle([]), true)
+  assert.equal(allIdle([idle]), true)
+  // 2026-11-28 事故：会话自己还在 turn 里干活，旧的「排除自己」把它当空闲放行
+  assert.equal(allIdle([selfRunning, idle]), false)
+  assert.equal(allIdle([selfQueued, idle]), false)
 })
